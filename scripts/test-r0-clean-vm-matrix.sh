@@ -14,8 +14,12 @@ KNOWN_HOSTS="$STATE_ROOT/known_hosts"
 HOST_BACKEND_IMAGE="${AIOPS_R0_HOST_BACKEND_IMAGE:-agent-ops-backend:r0-matrix}"
 HOST_FRONTEND_IMAGE="${AIOPS_R0_HOST_FRONTEND_IMAGE:-agent-ops-frontend:r0-matrix}"
 HOST_TEST_IMAGE="${AIOPS_R0_HOST_TEST_IMAGE:-agent-ops-backend-test:r0-matrix}"
-HOST_BACKEND_ID=""
-HOST_FRONTEND_ID=""
+REGISTRY_NAME="agent-ops-r0-registry"
+REGISTRY_PORT="${AIOPS_R0_REGISTRY_PORT:-55005}"
+HOST_REGISTRY="127.0.0.1:$REGISTRY_PORT"
+VM_REGISTRY="192.168.122.1:$REGISTRY_PORT"
+HOST_BACKEND_DIGEST=""
+HOST_FRONTEND_DIGEST=""
 if [ -n "${AIOPS_SOURCE_COMMIT:-}" ]; then
   COMMIT_SHA="$AIOPS_SOURCE_COMMIT"
 elif COMMIT_SHA="$(git -C "$ROOT_DIR" rev-parse --verify HEAD 2>/dev/null)"; then
@@ -68,8 +72,42 @@ build_diagnostic_images() {
   docker build --pull --tag "$HOST_BACKEND_IMAGE" --file "$ROOT_DIR/backend/Dockerfile" "$ROOT_DIR"
   docker build --pull --tag "$HOST_FRONTEND_IMAGE" --file "$ROOT_DIR/frontend/Dockerfile" "$ROOT_DIR"
   docker build --pull --tag "$HOST_TEST_IMAGE" --file "$ROOT_DIR/backend/Dockerfile.test" "$ROOT_DIR"
-  HOST_BACKEND_ID="$(docker image inspect "$HOST_BACKEND_IMAGE" --format '{{.Id}}')"
-  HOST_FRONTEND_ID="$(docker image inspect "$HOST_FRONTEND_IMAGE" --format '{{.Id}}')"
+}
+
+cleanup_registry() {
+  docker rm -f "$REGISTRY_NAME" >/dev/null 2>&1 || true
+  docker image rm \
+    "$HOST_REGISTRY/agent-ops-backend:$COMMIT_SHA" \
+    "$HOST_REGISTRY/agent-ops-frontend:$COMMIT_SHA" >/dev/null 2>&1 || true
+}
+
+push_release_images() {
+  local backend_ref="$HOST_REGISTRY/agent-ops-backend:$COMMIT_SHA"
+  local frontend_ref="$HOST_REGISTRY/agent-ops-frontend:$COMMIT_SHA"
+  local backend_repo frontend_repo
+  cleanup_registry
+  docker pull registry:2 >/dev/null
+  docker run --detach --rm \
+    --name "$REGISTRY_NAME" \
+    --publish "127.0.0.1:$REGISTRY_PORT:5000" \
+    --publish "192.168.122.1:$REGISTRY_PORT:5000" \
+    registry:2 >/dev/null
+  for _ in $(seq 1 30); do
+    curl --fail --silent "http://127.0.0.1:$REGISTRY_PORT/v2/" >/dev/null && break
+    sleep 1
+  done
+  curl --fail --silent "http://127.0.0.1:$REGISTRY_PORT/v2/" >/dev/null || \
+    fail "ephemeral OCI registry did not become ready"
+  docker tag "$HOST_BACKEND_IMAGE" "$backend_ref"
+  docker tag "$HOST_FRONTEND_IMAGE" "$frontend_ref"
+  docker push "$backend_ref" >/dev/null
+  docker push "$frontend_ref" >/dev/null
+  backend_repo="${backend_ref%:*}"
+  frontend_repo="${frontend_ref%:*}"
+  HOST_BACKEND_DIGEST="$(docker image inspect "$backend_ref" --format '{{range .RepoDigests}}{{println .}}{{end}}' | awk -F@ -v repo="$backend_repo" '$1 == repo {print $2; exit}')"
+  HOST_FRONTEND_DIGEST="$(docker image inspect "$frontend_ref" --format '{{range .RepoDigests}}{{println .}}{{end}}' | awk -F@ -v repo="$frontend_repo" '$1 == repo {print $2; exit}')"
+  [[ "$HOST_BACKEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "backend OCI digest was not resolved"
+  [[ "$HOST_FRONTEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "frontend OCI digest was not resolved"
 }
 
 download_verified_cloud_image() {
@@ -262,25 +300,51 @@ sync_checkout() {
     "$ROOT_DIR/" "aiops@$ip:/home/aiops/agent-ops/"
 }
 
-transfer_image() {
+transfer_test_image() {
   local ip="$1"
   local source_image="$2"
   local target_image="$3"
-  local source_id remote_id
+  local source_fingerprint remote_fingerprint
   local -a options
   mapfile -t options < <(ssh_args)
-  source_id="$(docker image inspect "$source_image" --format '{{.Id}}')"
+  source_fingerprint="$(docker image inspect "$source_image" --format '{{json .Config}}{{json .RootFS}}' | sha256sum | awk '{print $1}')"
   docker save "$source_image" | \
     ssh "${options[@]}" "aiops@$ip" "docker load >/dev/null && docker tag '$source_image' '$target_image'"
-  remote_id="$(ssh "${options[@]}" "aiops@$ip" "docker image inspect '$target_image' --format '{{.Id}}'")"
-  [ "$remote_id" = "$source_id" ] || fail "$target_image image ID changed during transfer"
+  remote_fingerprint="$(ssh "${options[@]}" "aiops@$ip" "docker image inspect '$target_image' --format '{{json .Config}}{{json .RootFS}}'" | sha256sum | awk '{print $1}')"
+  [ "$remote_fingerprint" = "$source_fingerprint" ] || fail "$target_image content changed during transfer"
+}
+
+configure_vm_registry() {
+  local ip="$1"
+  local -a options
+  mapfile -t options < <(ssh_args)
+  ssh "${options[@]}" "aiops@$ip" bash -s -- "$VM_REGISTRY" <<'REMOTE'
+set -euo pipefail
+registry="$1"
+printf '{"insecure-registries":["%s"]}\n' "$registry" | sudo tee /etc/docker/daemon.json >/dev/null
+sudo systemctl restart docker
+docker info --format '{{json .RegistryConfig.IndexConfigs}}' | grep -F "$registry" >/dev/null
+REMOTE
+}
+
+pull_release_image() {
+  local ip="$1"
+  local repository="$2"
+  local digest="$3"
+  local target_image="$4"
+  local image_ref="$VM_REGISTRY/$repository@$digest"
+  local -a options
+  mapfile -t options < <(ssh_args)
+  ssh "${options[@]}" "aiops@$ip" \
+    "docker pull '$image_ref' >/dev/null && docker tag '$image_ref' '$target_image' && docker image inspect '$image_ref' --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep -F '@$digest' >/dev/null"
 }
 
 transfer_diagnostic_images() {
   local ip="$1"
-  transfer_image "$ip" "$HOST_BACKEND_IMAGE" agent-ops-backend:r0-ci
-  transfer_image "$ip" "$HOST_FRONTEND_IMAGE" agent-ops-frontend:r0-ci
-  transfer_image "$ip" "$HOST_TEST_IMAGE" agent-ops-backend-test:r0-ci
+  configure_vm_registry "$ip"
+  pull_release_image "$ip" agent-ops-backend "$HOST_BACKEND_DIGEST" agent-ops-backend:r0-ci
+  pull_release_image "$ip" agent-ops-frontend "$HOST_FRONTEND_DIGEST" agent-ops-frontend:r0-ci
+  transfer_test_image "$ip" "$HOST_TEST_IMAGE" agent-ops-backend-test:r0-ci
 }
 
 run_vm_gate() {
@@ -295,7 +359,7 @@ run_vm_gate() {
 
   set +e
   ssh "${options[@]}" "aiops@$ip" \
-    "AIOPS_EXPECTED_OS='$expected_os' AIOPS_EXPECTED_DOCKER_MAJOR='$docker_major' AIOPS_EXPECTED_BACKEND_IMAGE_ID='$HOST_BACKEND_ID' AIOPS_EXPECTED_FRONTEND_IMAGE_ID='$HOST_FRONTEND_ID' AIOPS_SOURCE_COMMIT='$COMMIT_SHA' bash -s" \
+    "AIOPS_EXPECTED_OS='$expected_os' AIOPS_EXPECTED_DOCKER_MAJOR='$docker_major' AIOPS_EXPECTED_BACKEND_DIGEST='$HOST_BACKEND_DIGEST' AIOPS_EXPECTED_FRONTEND_DIGEST='$HOST_FRONTEND_DIGEST' AIOPS_BACKEND_IMAGE_REF='$VM_REGISTRY/agent-ops-backend@$HOST_BACKEND_DIGEST' AIOPS_FRONTEND_IMAGE_REF='$VM_REGISTRY/agent-ops-frontend@$HOST_FRONTEND_DIGEST' AIOPS_SOURCE_COMMIT='$COMMIT_SHA' bash -s" \
     <<'REMOTE' 2>&1 | tee "$log"
 set -euo pipefail
 cd /home/aiops/agent-ops
@@ -305,8 +369,8 @@ export AIOPS_COMMIT_SHA="$AIOPS_SOURCE_COMMIT"
 [ "$(uname -m)" = "x86_64" ]
 case "$(findmnt -no FSTYPE /)" in ext4|xfs) ;; *) echo "root filesystem is outside support policy" >&2; exit 1 ;; esac
 [ "$(docker version --format '{{.Server.Version}}' | cut -d. -f1)" = "$AIOPS_EXPECTED_DOCKER_MAJOR" ]
-[ "$(docker image inspect agent-ops-backend:r0-ci --format '{{.Id}}')" = "$AIOPS_EXPECTED_BACKEND_IMAGE_ID" ]
-[ "$(docker image inspect agent-ops-frontend:r0-ci --format '{{.Id}}')" = "$AIOPS_EXPECTED_FRONTEND_IMAGE_ID" ]
+docker image inspect "$AIOPS_BACKEND_IMAGE_REF" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep -F "@$AIOPS_EXPECTED_BACKEND_DIGEST" >/dev/null
+docker image inspect "$AIOPS_FRONTEND_IMAGE_REF" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep -F "@$AIOPS_EXPECTED_FRONTEND_DIGEST" >/dev/null
 docker run --rm agent-ops-backend-test:r0-ci
 python_wrapper="$(mktemp)"
 cat > "$python_wrapper" <<'SH'
@@ -325,8 +389,8 @@ AIOPS_PYTHON_BIN="$python_wrapper" ./scripts/verify-production-baseline.sh
 rm -f "$python_wrapper"
 AIOPS_RUN_PRODUCTION_PLAYWRIGHT=0 ./scripts/test-production-compose.sh
 mkdir -p .omx/evidence/production-ga/GA-R0-001
-export AIOPS_BACKEND_IMAGE_ID="$(docker image inspect agent-ops-backend:r0-ci --format '{{.Id}}')"
-export AIOPS_FRONTEND_IMAGE_ID="$(docker image inspect agent-ops-frontend:r0-ci --format '{{.Id}}')"
+export AIOPS_BACKEND_CONFIG_ID="$(docker image inspect agent-ops-backend:r0-ci --format '{{.Id}}')"
+export AIOPS_FRONTEND_CONFIG_ID="$(docker image inspect agent-ops-frontend:r0-ci --format '{{.Id}}')"
 export AIOPS_DOCKER_VERSION="$(docker version --format '{{.Server.Version}}')"
 export AIOPS_COMPOSE_VERSION="$(docker compose version --short)"
 export AIOPS_KERNEL="$(uname -r)"
@@ -348,7 +412,7 @@ payload = {
     "expected": "all R0 local gates pass while Worker, Agent, mutation and unverified LLM remain fail-closed",
     "evidence_path": f".omx/evidence/production-ga/GA-R0-001/{name}.json",
     "owner": "backend and release leads",
-    "release_digest": os.environ["AIOPS_BACKEND_IMAGE_ID"],
+    "release_digest": os.environ["AIOPS_EXPECTED_BACKEND_DIGEST"],
     "result": "passed",
     "executed_at": datetime.now(timezone.utc).isoformat(),
     "commit_sha": os.environ["AIOPS_SOURCE_COMMIT"],
@@ -356,8 +420,11 @@ payload = {
     "filesystem": os.environ["AIOPS_FILESYSTEM"],
     "docker_engine": os.environ["AIOPS_DOCKER_VERSION"],
     "docker_compose": os.environ["AIOPS_COMPOSE_VERSION"],
-    "backend_image_id": os.environ["AIOPS_BACKEND_IMAGE_ID"],
-    "frontend_image_id": os.environ["AIOPS_FRONTEND_IMAGE_ID"],
+    "backend_image_ref": os.environ["AIOPS_BACKEND_IMAGE_REF"],
+    "frontend_image_ref": os.environ["AIOPS_FRONTEND_IMAGE_REF"],
+    "backend_config_id": os.environ["AIOPS_BACKEND_CONFIG_ID"],
+    "frontend_config_id": os.environ["AIOPS_FRONTEND_CONFIG_ID"],
+    "frontend_release_digest": os.environ["AIOPS_EXPECTED_FRONTEND_DIGEST"],
 }
 path = Path(payload["evidence_path"])
 path.parent.mkdir(parents=True, exist_ok=True)
@@ -374,7 +441,9 @@ REMOTE
 main() {
   require_host
   prepare_state
+  trap cleanup_registry EXIT
   build_diagnostic_images
+  push_release_images
   for row in "${MATRIX[@]}"; do
     IFS='|' read -r suffix release os_variant expected_os docker_major <<< "$row"
     name="agent-ops-r0-$suffix"
