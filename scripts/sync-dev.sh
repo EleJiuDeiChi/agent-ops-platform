@@ -14,7 +14,11 @@ rsync -az --delete \
   --include '.env.production.example' \
   --exclude '.env.*' \
   --exclude '.git/' \
-  --exclude '.omx/' \
+  --include '.omx/' \
+  --include '.omx/context/***' \
+  --include '.omx/plans/***' \
+  --include '.omx/specs/***' \
+  --exclude '.omx/***' \
   --exclude '.playwright-cli/' \
   --exclude '.playwright-mcp/' \
   --exclude '.codex-artifacts/' \
