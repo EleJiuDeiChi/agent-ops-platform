@@ -29,6 +29,7 @@ required_files=(
   scripts/assert-production-topology.py
   scripts/test-production-compose.sh
   scripts/test-r0-clean-vm-matrix.sh
+  scripts/run-r0-clean-vm-matrix-devbox.sh
 )
 
 for file in "${required_files[@]}"; do
@@ -43,6 +44,14 @@ done
 "$PYTHON_BIN" "$ROOT_DIR/scripts/probe-llm-contract.py" --help >/dev/null
 "$ROOT_DIR/scripts/deploy-production.sh" --help >/dev/null
 "$ROOT_DIR/scripts/assert-production-topology.py" --help >/dev/null
+
+for marker in "ubuntu-cloudimage-keyring" "source_archive_sha256" \
+  "docker_ce_package" "registry@sha256:"; do
+  grep -q "$marker" "$ROOT_DIR/scripts/test-r0-clean-vm-matrix.sh" || {
+    echo "clean-VM evidence marker is missing: $marker" >&2
+    exit 1
+  }
+done
 
 for marker in "syft-version: v1.46.0" "version: v0.72.0" "cosign-release: v3.1.1" \
   "provenance: mode=max" "environment:" "production-release"; do

@@ -123,6 +123,29 @@ Expected R0 readiness explicitly reports Worker and Agent as
 recorded. Mutating/destructive capabilities must be disabled and must never
 write a success task/event.
 
+For the R0 clean-host gate, run the following only on the designated Linux KVM
+lab host with passwordless sudo and the libvirt `default` network. It downloads
+Ubuntu official cloud images, verifies their published SHA-256 sums, creates
+namespaced disposable guests and destroys them after success:
+
+```bash
+AIOPS_SOURCE_COMMIT="$(git rev-parse HEAD)" \
+  ./scripts/test-r0-clean-vm-matrix.sh
+```
+
+When the KVM development machine intentionally has no `.git` directory, run
+the local wrapper instead. It rejects a dirty worktree, creates a signed-source
+archive from the exact commit, transfers only that archive, and invokes the
+same remote gate:
+
+```bash
+./scripts/run-r0-clean-vm-matrix-devbox.sh
+```
+
+The harness must report the same backend and frontend OCI manifest digests for
+Ubuntu 22.04/Docker 28 and Ubuntu 24.04/Docker 29. A `docker save/load` config
+ID or a container pretending to be a VM is not accepted evidence.
+
 ## 5. Stop, rollback and recovery limitations
 
 ```bash

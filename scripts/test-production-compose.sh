@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aiops-prod-compose.XXXXXX")"
 PROJECT_NAME="agent-ops-r0-runtime-${RANDOM}"
 HTTPS_PORT="${AIOPS_TEST_HTTPS_PORT:-55443}"
+PRESERVE_ON_FAILURE="${AIOPS_PRESERVE_ON_FAILURE:-0}"
 
 export AIOPS_IMAGE_TAG="${AIOPS_IMAGE_TAG:-r0-ci}"
 if [ -z "${AIOPS_BACKEND_IMAGE_REF:-}" ]; then
@@ -52,6 +53,10 @@ cleanup() {
     echo "production Compose validation failed; preserving diagnostics before cleanup" >&2
     "${COMPOSE_PROD[@]}" ps >&2 || true
     "${COMPOSE_PROD[@]}" logs --no-color --tail 200 >&2 || true
+    if [ "$PRESERVE_ON_FAILURE" = "1" ]; then
+      echo "runtime containers, volume and secret fixture retained for offline VM forensics" >&2
+      return "$status"
+    fi
   fi
   "${COMPOSE_PROD[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$TMP_DIR"

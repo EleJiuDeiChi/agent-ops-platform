@@ -105,7 +105,7 @@ R0 只是生产基线，不是 GA。独立 Worker/Node Agent 尚未实现，所�
 mutating/destructive placeholder capability 必须保持 disabled；当前部署
 不得声称能真实修改宿主机。以下证据完成前禁止公网正式投产：
 
-- Ubuntu clean-VM 安装、镜像 digest/SBOM/签名和依赖/容器扫描；
+- 受保护 release 的 GHCR digest、SBOM、签名、provenance 和容器扫描；
 - DeepSeek/OpenAI-compatible `/models`、tool-calling、脱敏与数据条款 live probe；
 - 版本化迁移、异地备份恢复、可观测性、升级/回滚和完整 CI/CD；
 - R1-R7 的 Agent、任务、安全、领域能力、UI、试点和 soak/canary gate。
@@ -117,3 +117,7 @@ mutating/destructive placeholder capability 必须保持 disabled；当前部署
 - `AIOPS_DEBUG_SKIP_PASSWORD_CHANGE=1`；
 - 容器 privileged、Docker socket、宿主根目录或 Agent socket 挂载；
 - 把 mock LLM、placeholder success 或静态 Compose 校验当成生产证据。
+
+Ubuntu 22.04/Docker 28 与 Ubuntu 24.04/Docker 29 的 clean KVM 诊断矩阵已
+通过同一组 OCI manifest digest，但这些仍是未签名诊断制品，不代表公开
+Release 或生产 GA。

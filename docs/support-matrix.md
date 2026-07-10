@@ -17,13 +17,13 @@ Status vocabulary:
 
 | Area | Intended first-GA range | Evidence in this checkout / boundary | Status |
 | --- | --- | --- | --- |
-| OS | Ubuntu Server 22.04 LTS and 24.04 LTS, x86_64 | No clean Ubuntu VM manifest yet. Local remediation ran on macOS 26.4 arm64, which is not a production target. | TARGET |
-| Filesystem | local ext4 or xfs | No Linux filesystem runtime evidence yet. SQLite on NFS/SMB is explicitly rejected. | TARGET |
+| OS | Ubuntu Server 22.04 LTS and 24.04 LTS, x86_64 | Clean KVM manifests passed on 22.04 (`5.15.0-185`) and 24.04 (`6.8.0-124`); the authoritative commit and source-archive hash live in `matrix-summary.json`. The images are diagnostic, not signed release artifacts. | EVIDENCE-ONLY |
+| Filesystem | local ext4 or xfs | Both clean-VM gates passed on local ext4. xfs has not run. SQLite on NFS/SMB is explicitly rejected. | EVIDENCE-ONLY |
 | Init/firewall | systemd + UFW | Mutation remains disabled; no destructive-lab evidence. | TARGET |
-| Docker Engine | Candidate release lines 28.x and 29.x, exact patch captured per release test | Local runtime evidence uses Engine 27.4.0 only; this does not validate the candidate range. CI records its runner version in the supply-chain artifact. | TARGET |
-| Docker Compose | Compose plugin that supports the checked production schema, `config --format json`, health dependencies and secrets | Local static/runtime evidence uses Compose 2.31.0-desktop.2. No exact production support floor/ceiling is claimed until the Ubuntu VM matrix runs. | TARGET |
-| Platform frontend | Build input `node:22.23.1-bookworm-slim`; runtime input `nginx:1.28.3-alpine3.23` | Tags are pinned inputs. Only CI-produced digest + SPDX SBOM + Trivy result + protected release signature can become release evidence. | TARGET |
-| Platform backend | Build input `python:3.12.13-slim-bookworm` | Same digest-bound evidence rule; a mutable tag is never the supported artifact identity. | TARGET |
+| Docker Engine | Candidate release lines 28.x and 29.x, exact patch captured per release test | The same OCI manifests passed on Engine 28.5.2/Ubuntu 22.04 and 29.6.1/Ubuntu 24.04. CI must repeat against the protected release digest before `SUPPORTED`. | EVIDENCE-ONLY |
+| Docker Compose | Compose plugin that supports the checked production schema, `config --format json`, health dependencies and secrets | Compose 5.3.1 passed on both clean VMs; older local Compose 2.31.0 also passed diagnostic topology. The release floor/ceiling is not a support promise until signed-release CI repeats it. | EVIDENCE-ONLY |
+| Platform frontend | Build input `node:22.23.1-bookworm-slim`; runtime input `nginx:1.28.3-alpine3.23` | Diagnostic OCI digest `sha256:2e3aa328d5a3fa654c13e7d3605137f671e302260c63c1d503bbde020c3da370` passed on both clean VMs. It is unsigned and cannot become a GA release. | EVIDENCE-ONLY |
+| Platform backend | Build input `python:3.12.13-slim-bookworm` | Diagnostic OCI digest `sha256:5b58dfed22d52cd5b53076434c0a968ec5ace1436d065e6f323a66545a543de2` passed on both clean VMs. The protected release must reproduce, scan and sign its own digest. | EVIDENCE-ONLY |
 | Managed Nginx | Ubuntu distribution Nginx | Read-only diagnostics only; exact apt version is captured by the future clean-VM/R4C manifest. | TARGET |
 | ACME | HTTP-01 only | No live ACME evidence. DNS-01 is outside first GA. | TARGET |
 
@@ -51,8 +51,8 @@ passes against the signed release digest.
 
 | Client | Intended range | Evidence in this remediation | Status |
 | --- | --- | --- | --- |
-| Chrome | current two stable majors at release freeze | Google Chrome 150.0.7871.115 on macOS; one login E2E path. This is one evidence point, not a two-major matrix. | EVIDENCE-ONLY |
-| Edge | current two stable majors at release freeze | No current run. | TARGET |
+| Chrome | current two stable majors at release freeze | Google Chrome 150.0.7871.115 on macOS; three TLS production-topology paths passed. This is one evidence point, not a two-major matrix. | EVIDENCE-ONLY |
+| Edge | current two stable majors at release freeze | Microsoft Edge 150.0.4078.50 on macOS; the same three TLS production-topology paths passed. This is one evidence point, not a two-major matrix. | EVIDENCE-ONLY |
 | Firefox | current two stable majors at release freeze | No current run. | TARGET |
 | Safari | current stable major at release freeze | Safari 26.4 on macOS; full critical-path matrix remains incomplete. | EVIDENCE-ONLY |
 | Mobile | current iOS/Android browsers | View and approval only; administration and mutation are unsupported. | TARGET |
@@ -60,6 +60,16 @@ passes against the signed release digest.
 The CI Playwright job provides Chromium evidence only. A production-topology
 hook exists at `scripts/test-production-browser.sh`; it intentionally bypasses
 the Vite `webServer` configuration and targets an already-running TLS topology.
+
+Clean-VM evidence is stored under
+`.omx/evidence/production-ga/GA-R0-001/agent-ops-r0-ubuntu{2204,2404}.json`.
+Each manifest records the GPG-verified cloud-image fixture and SHA-256, exact
+OS/kernel, filesystem, Engine/Compose package versions, source archive, commit
+and both OCI digests. The lab uses
+an ephemeral registry bound only to loopback and the libvirt bridge so Docker
+28 and 29 pull the same manifest rather than comparing unstable local config
+IDs. Passing diagnostic manifests do not replace GHCR, Trivy, SBOM, provenance
+or signature evidence.
 
 ## Live LLM contract
 

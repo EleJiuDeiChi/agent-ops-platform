@@ -59,8 +59,10 @@ Release verdict is `NO-GO` if any item is true:
 5. Build context contains demo, data, secrets, node_modules or a virtualenv.
 6. Any runtime web/control container runs as UID 0 or mounts Docker socket,
    Agent socket or host root.
-7. Support-matrix clean-VM/browser/DB evidence is absent or an unsupported
-   environment attempts mutation.
+7. The R0 clean Ubuntu 22.04/24.04 matrix is absent, the support range is not
+   frozen, or an unsupported environment attempts mutation. Full browser and
+   database domain support remain separate R5/R4 gates and must stay
+   `TARGET`/disabled until their own evidence exists.
 8. DeepSeek/OpenAI-compatible `/models`, tool calling, redaction, region,
    retention/training opt-out and owner approvals are incomplete.
 9. Runtime/dependency/container scans have P0/P1 findings, or signed digest,
@@ -79,10 +81,11 @@ reported as a production closure.
 ./scripts/verify-production-baseline.sh
 ./scripts/smoke.sh
 ./scripts/test-production-compose.sh
+./scripts/test-r0-clean-vm-matrix.sh  # designated Linux KVM lab only
 docker compose config
 docker compose --env-file .env.production -f deploy/compose.prod.yml config
 ```
 
-Docker image builds, clean-VM installation, TLS runtime, live LLM probe,
-destructive lab, SBOM/signature and remote deployment require their designated
-environments and evidence manifests. Static config success cannot substitute.
+Docker image builds, TLS runtime, live LLM probe, destructive lab,
+SBOM/signature and remote deployment require their designated environments and
+evidence manifests. Static config or a container-only run cannot substitute.
