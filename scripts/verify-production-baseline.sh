@@ -25,6 +25,7 @@ required_files=(
   docs/evidence/README.md
   .omx/specs/r0-production-baseline.md
   scripts/probe-llm-contract.py
+  scripts/verify-release-attestations.py
   scripts/deploy-production.sh
   scripts/assert-production-topology.py
   scripts/test-production-compose.sh
@@ -41,12 +42,15 @@ done
 
 "$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/probe-llm-contract.py"
 "$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/assert-production-topology.py"
+"$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/verify-release-attestations.py"
 "$PYTHON_BIN" "$ROOT_DIR/scripts/probe-llm-contract.py" --help >/dev/null
+"$PYTHON_BIN" "$ROOT_DIR/scripts/verify-release-attestations.py" --self-test
 "$ROOT_DIR/scripts/deploy-production.sh" --help >/dev/null
 "$ROOT_DIR/scripts/assert-production-topology.py" --help >/dev/null
 
 for marker in "ubuntu-cloudimage-keyring" "source_archive_sha256" \
-  "docker_ce_package" "registry@sha256:" "cleanup_success_artifacts"; do
+  "docker_ce_package" "registry@sha256:" "cleanup_success_artifacts" \
+  "VALIDSIG" "exactly one primary key" "scan_current_evidence_for_secrets"; do
   grep -q "$marker" "$ROOT_DIR/scripts/test-r0-clean-vm-matrix.sh" || {
     echo "clean-VM evidence marker is missing: $marker" >&2
     exit 1
@@ -54,7 +58,8 @@ for marker in "ubuntu-cloudimage-keyring" "source_archive_sha256" \
 done
 
 for marker in "syft-version: v1.46.0" "version: v0.72.0" "cosign-release: v3.1.1" \
-  "provenance: mode=max" "environment:" "production-release"; do
+  "provenance: mode=max" "environment:" "production-release" \
+  "verify-release-attestations.py"; do
   grep -q "$marker" "$ROOT_DIR/.github/workflows/r0-ci.yml" || {
     echo "R0 CI supply-chain marker is missing: $marker" >&2
     exit 1
@@ -87,6 +92,8 @@ grep -q 'AIOPS_LLM_API_KEY_FILE: /run/secrets/llm_api_key' "$ROOT_DIR/deploy/com
 grep -q 'AIOPS_LLM_EVIDENCE_FILE: /run/secrets/llm_evidence' "$ROOT_DIR/deploy/compose.prod.yml"
 grep -q 'cosign verify' "$ROOT_DIR/scripts/deploy-production.sh"
 grep -q 'verify-attestation' "$ROOT_DIR/scripts/deploy-production.sh"
+grep -q 'verify-release-attestations.py' "$ROOT_DIR/scripts/deploy-production.sh"
+grep -q 'assert-production-topology.py' "$ROOT_DIR/scripts/deploy-production.sh"
 if grep -Eq 'AIOPS_(SESSION_SECRET|LLM_API_KEY):' "$ROOT_DIR/deploy/compose.prod.yml"; then
   echo "production compose must use secret files, not direct secret values" >&2
   exit 1

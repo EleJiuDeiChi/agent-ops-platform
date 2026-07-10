@@ -87,7 +87,7 @@ require_host() {
 
 prepare_state() {
   mkdir -p "$STATE_ROOT/cache" "$STATE_ROOT/runs" "$RUN_DIR" "$EVIDENCE_DIR"
-  exec 9>"$STATE_ROOT/matrix.lock"
+  exec 9>"$EVIDENCE_DIR/.matrix.lock"
   flock -n 9 || fail "another R0 clean-VM matrix is already running"
   : > "$KNOWN_HOSTS"
   chmod 0600 "$KNOWN_HOSTS"
@@ -242,8 +242,23 @@ download_verified_cloud_image() {
 
   curl --fail --location --retry 3 "$base_url/SHA256SUMS" --output "$sums"
   curl --fail --location --retry 3 "$base_url/SHA256SUMS.gpg" --output "$signature"
-  gpgv --keyring "$CLOUD_KEYRING" "$signature" "$sums" >/dev/null 2>&1 || \
+  local gpg_status="$RUN_DIR/${release}-gpgv.status"
+  gpgv --status-fd 1 --keyring "$CLOUD_KEYRING" "$signature" "$sums" \
+    >"$gpg_status" 2>/dev/null || \
     fail "Ubuntu signature verification failed for $release SHA256SUMS"
+  python3 - "$gpg_status" "$CLOUD_SIGNING_SUBKEY_FINGERPRINT" "$CLOUD_KEY_FINGERPRINT" <<'PY'
+import sys
+from pathlib import Path
+
+status_path, expected_signer, expected_primary = sys.argv[1:]
+valid = []
+for line in Path(status_path).read_text(encoding="utf-8").splitlines():
+    fields = line.split()
+    if len(fields) >= 3 and fields[:2] == ["[GNUPG:]", "VALIDSIG"]:
+        valid.append((fields[2], fields[-1]))
+if valid != [(expected_signer, expected_primary)]:
+    raise SystemExit(f"unexpected Ubuntu SHA256SUMS signer: {valid!r}")
+PY
   checksum_line="$(grep -E "[ *]${filename}$" "$sums")"
   [ "$(printf '%s\n' "$checksum_line" | wc -l | tr -d ' ')" = "1" ] || \
     fail "official SHA256SUMS did not contain exactly one $filename entry"
@@ -413,9 +428,13 @@ curl --fail --silent --show-error --location \
   --retry 8 --retry-all-errors --connect-timeout 20 --max-time 180 \
   https://download.docker.com/linux/ubuntu/gpg --output "$docker_gpg"
 actual_fingerprint="$(gpg --batch --with-colons --show-keys "$docker_gpg" | awk -F: '$1 == "fpr" {print $10; exit}')"
+primary_count="$(gpg --batch --with-colons --show-keys "$docker_gpg" | awk -F: '$1 == "pub" {count++} END {print count+0}')"
+[ "$primary_count" = "1" ] || { echo "Docker apt key must contain exactly one primary key" >&2; exit 1; }
 [ "$actual_fingerprint" = "$expected_fingerprint" ] || { echo "Docker apt key fingerprint mismatch" >&2; exit 1; }
 sudo gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg "$docker_gpg"
 sudo chmod a+r /etc/apt/keyrings/docker.gpg
+[ "$(gpg --batch --with-colons --show-keys /etc/apt/keyrings/docker.gpg | awk -F: '$1 == "pub" {count++} END {print count+0}')" = "1" ]
+[ "$(gpg --batch --with-colons --show-keys /etc/apt/keyrings/docker.gpg | awk -F: '$1 == "fpr" {print $10; exit}')" = "$expected_fingerprint" ]
 printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu %s stable\n' \
   "$(dpkg --print-architecture)" "$VERSION_CODENAME" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
 sudo apt-get -o Acquire::Retries=5 update -qq
@@ -629,10 +648,11 @@ sanitize_and_power_off_vm() {
   local name="$1"
   local ip="$2"
   local strict="$3"
-  local state
+  local mac state restore_failed=0
   if [ -n "$ip" ]; then
     if ! restore_vm_registry_config "$ip"; then
-      [ "$strict" = "0" ] || return 1
+      restore_failed=1
+      echo "warning: Docker daemon configuration could not be restored on $name" >&2
     fi
   fi
   if sudo virsh dominfo "$name" >/dev/null 2>&1; then
@@ -645,11 +665,41 @@ sanitize_and_power_off_vm() {
         sleep 1
       done
       if [ "$state" != "shut off" ]; then
-        sudo virsh destroy "$name" >/dev/null || [ "$strict" = "0" ] || return 1
+        if ! sudo virsh destroy "$name" >/dev/null; then
+          while read -r mac; do
+            [ -n "$mac" ] || continue
+            sudo virsh domif-setlink "$name" "$mac" down --live >/dev/null 2>&1 || true
+            sudo virsh domif-setlink "$name" "$mac" down --config >/dev/null 2>&1 || true
+          done < <(sudo virsh domiflist "$name" | awk '$2 == "network" {print $5}')
+        fi
       fi
     fi
-    [ "$(sudo virsh domstate "$name" | tr -d '\r')" = "shut off" ] || [ "$strict" = "0" ] || return 1
+    [ "$(sudo virsh domstate "$name" | tr -d '\r')" = "shut off" ] || return 1
   fi
+  [ "$restore_failed" = "0" ] || [ "$strict" = "0" ] || return 1
+}
+
+scan_current_evidence_for_secrets() {
+  python3 - "$RUN_LOG" \
+    "$EVIDENCE_DIR/agent-ops-r0-ubuntu2204-$RUN_ID.log" \
+    "$EVIDENCE_DIR/agent-ops-r0-ubuntu2404-$RUN_ID.log" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+patterns = (
+    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    re.compile(r"(?i)authorization:\s*bearer\s+[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(r"AIOPS_(?:SESSION_SECRET|LLM_API_KEY|SETUP_TOKEN)=[^\s]+"),
+    re.compile(r'(?i)"(?:api[_-]?key|session[_-]?secret|setup[_-]?token)"\s*:\s*"(?!\*{3}|<redacted>)[^"\s]{8,}"'),
+)
+for raw_path in sys.argv[1:]:
+    path = Path(raw_path)
+    text = path.read_text(encoding="utf-8", errors="replace")
+    for pattern in patterns:
+        if pattern.search(text):
+            raise SystemExit(f"potential secret material found in evidence log: {path}")
+PY
 }
 
 generate_matrix_summary() {
@@ -707,15 +757,36 @@ PY
 }
 
 cleanup_on_exit() {
-  local status=$?
+  local status=$? state
   trap - EXIT
   if [ "$status" -ne 0 ]; then
     if [ -n "$CURRENT_VM_NAME" ]; then
-      sanitize_and_power_off_vm "$CURRENT_VM_NAME" "$CURRENT_VM_IP" 0 || true
-      echo "failure VM retained offline: $CURRENT_VM_NAME" >&2
-      echo "failure disk retained: $IMAGE_ROOT/$CURRENT_VM_NAME.qcow2" >&2
+      if sanitize_and_power_off_vm "$CURRENT_VM_NAME" "$CURRENT_VM_IP" 0; then
+        if sudo virsh dominfo "$CURRENT_VM_NAME" >/dev/null 2>&1; then
+          state="$(sudo virsh domstate "$CURRENT_VM_NAME" | tr -d '\r')"
+          if [ "$state" = "shut off" ]; then
+            echo "failure VM retained offline: $CURRENT_VM_NAME" >&2
+          else
+            echo "CRITICAL: failure VM is still online with state $state: $CURRENT_VM_NAME" >&2
+          fi
+        elif [ -e "$IMAGE_ROOT/$CURRENT_VM_NAME.qcow2" ]; then
+          echo "partial failure disk retained without a defined VM: $IMAGE_ROOT/$CURRENT_VM_NAME.qcow2" >&2
+        else
+          echo "failure occurred before VM artifacts were created: $CURRENT_VM_NAME" >&2
+        fi
+      else
+        echo "CRITICAL: could not prove failure VM is offline; interfaces were forced down where possible: $CURRENT_VM_NAME" >&2
+        sudo virsh dominfo "$CURRENT_VM_NAME" >&2 2>/dev/null || true
+        sudo virsh domiflist "$CURRENT_VM_NAME" >&2 2>/dev/null || true
+      fi
+      [ ! -e "$IMAGE_ROOT/$CURRENT_VM_NAME.qcow2" ] || \
+        echo "failure disk retained: $IMAGE_ROOT/$CURRENT_VM_NAME.qcow2" >&2
     fi
-    cleanup_registry || true
+    if ! cleanup_registry; then
+      echo "CRITICAL: ephemeral registry cleanup failed: $REGISTRY_NAME on port $REGISTRY_PORT" >&2
+      docker container inspect "$REGISTRY_NAME" >&2 2>/dev/null || true
+      ss -H -ltnp | awk -v suffix=":$REGISTRY_PORT" '$4 ~ suffix "$"' >&2 || true
+    fi
     echo "run log retained: $RUN_LOG" >&2
   fi
   exit "$status"
@@ -767,10 +838,11 @@ main() {
     CURRENT_VM_NAME=""
     CURRENT_VM_IP=""
   done
-  generate_matrix_summary
+  scan_current_evidence_for_secrets
   cleanup_registry || fail "ephemeral registry or listening port was not removed"
   REGISTRY_STARTED=0
   cleanup_success_artifacts
+  generate_matrix_summary
   echo "R0 clean-VM matrix passed"
 }
 

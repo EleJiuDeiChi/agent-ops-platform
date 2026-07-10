@@ -51,6 +51,10 @@ command -v cosign >/dev/null 2>&1 || {
   echo "cosign is required; install the reviewed version from docs/evidence/README.md" >&2
   exit 1
 }
+cosign version 2>&1 | grep -Eq 'GitVersion:[[:space:]]+v3\.1\.1([[:space:]]|$)' || {
+  echo "cosign v3.1.1 is required by the reviewed release policy" >&2
+  exit 1
+}
 CERTIFICATE_IDENTITY="${AIOPS_COSIGN_CERTIFICATE_IDENTITY:?set the exact release workflow certificate identity}"
 OIDC_ISSUER="${AIOPS_COSIGN_OIDC_ISSUER:?set the expected release OIDC issuer}"
 
@@ -106,15 +110,37 @@ for name, expected_uid in expected_secret_owners.items():
         raise SystemExit(
             f"{name} must be owned by UID {expected_uid} with mode 0400"
         )
+ports = (services.get("frontend") or {}).get("ports") or []
+if len(ports) != 1:
+    raise SystemExit("frontend must publish exactly one HTTPS port")
+published = ports[0]
+commit = str(backend_env.get("AIOPS_COMMIT_SHA") or "")
+if not re.fullmatch(r"[0-9a-f]{40}", commit):
+    raise SystemExit("AIOPS_COMMIT_SHA must be a full lowercase Git commit")
 print(backend)
 print(frontend)
+print(published.get("host_ip") or "")
+print(published.get("published") or "")
+print(commit)
 PY
 
 BACKEND_IMAGE_REF="$(sed -n '1p' "$TMP_DIR/images.txt")"
 FRONTEND_IMAGE_REF="$(sed -n '2p' "$TMP_DIR/images.txt")"
+HTTPS_BIND="$(sed -n '3p' "$TMP_DIR/images.txt")"
+HTTPS_PORT="$(sed -n '4p' "$TMP_DIR/images.txt")"
+COMMIT_SHA="$(sed -n '5p' "$TMP_DIR/images.txt")"
+
+topology_args=(compose "$TMP_DIR/compose.json" --https-bind "$HTTPS_BIND" --https-port "$HTTPS_PORT")
+if [ "$SETUP" = "1" ]; then
+  topology_args+=(--setup)
+fi
+"$ROOT_DIR/scripts/assert-production-topology.py" "${topology_args[@]}"
 
 verify_image() {
   local image_ref="$1"
+  local label="$2"
+  local provenance="$TMP_DIR/$label-provenance.json"
+  local sbom="$TMP_DIR/$label-sbom.json"
   cosign verify \
     --certificate-identity "$CERTIFICATE_IDENTITY" \
     --certificate-oidc-issuer "$OIDC_ISSUER" \
@@ -123,20 +149,38 @@ verify_image() {
     --type slsaprovenance \
     --certificate-identity "$CERTIFICATE_IDENTITY" \
     --certificate-oidc-issuer "$OIDC_ISSUER" \
-    "$image_ref" > /dev/null
+    "$image_ref" > "$provenance"
   cosign verify-attestation \
     --type spdxjson \
     --certificate-identity "$CERTIFICATE_IDENTITY" \
     --certificate-oidc-issuer "$OIDC_ISSUER" \
-    "$image_ref" > /dev/null
+    "$image_ref" > "$sbom"
+  "$ROOT_DIR/scripts/verify-release-attestations.py" \
+    --provenance "$provenance" \
+    --sbom "$sbom" \
+    --image-ref "$image_ref" \
+    --commit-sha "$COMMIT_SHA" \
+    --certificate-identity "$CERTIFICATE_IDENTITY"
   docker pull "$image_ref" > /dev/null
 }
 
-verify_image "$BACKEND_IMAGE_REF"
-verify_image "$FRONTEND_IMAGE_REF"
+verify_image "$BACKEND_IMAGE_REF" backend
+verify_image "$FRONTEND_IMAGE_REF" frontend
 echo "signed release verification passed for both immutable image digests"
 
 if [ "$ACTION" = "up" ]; then
   "${COMPOSE[@]}" up -d --no-build
+  BACKEND_ID="$("${COMPOSE[@]}" ps -q backend)"
+  FRONTEND_ID="$("${COMPOSE[@]}" ps -q frontend)"
+  [ -n "$BACKEND_ID" ] && [ -n "$FRONTEND_ID" ] || {
+    echo "production services did not create both expected containers" >&2
+    exit 1
+  }
+  docker inspect "$BACKEND_ID" "$FRONTEND_ID" > "$TMP_DIR/runtime-inspect.json"
+  runtime_args=(runtime "$TMP_DIR/runtime-inspect.json" --https-bind "$HTTPS_BIND" --https-port "$HTTPS_PORT")
+  if [ "$SETUP" = "1" ]; then
+    runtime_args+=(--setup)
+  fi
+  "$ROOT_DIR/scripts/assert-production-topology.py" "${runtime_args[@]}"
   echo "production Compose started from verified image digests"
 fi

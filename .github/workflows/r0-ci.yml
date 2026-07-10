@@ -350,12 +350,30 @@ jobs:
             --output json "$BACKEND_IMAGE@$BACKEND_DIGEST" > evidence/release/backend-cosign-verify.json
           cosign verify --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
             --output json "$FRONTEND_IMAGE@$FRONTEND_DIGEST" > evidence/release/frontend-cosign-verify.json
+          cosign verify-attestation --type slsaprovenance \
+            --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
+            "$BACKEND_IMAGE@$BACKEND_DIGEST" > evidence/release/backend-provenance-verify.json
+          cosign verify-attestation --type slsaprovenance \
+            --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
+            "$FRONTEND_IMAGE@$FRONTEND_DIGEST" > evidence/release/frontend-provenance-verify.json
           cosign verify-attestation --type spdxjson \
             --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
             "$BACKEND_IMAGE@$BACKEND_DIGEST" > evidence/release/backend-sbom-verify.json
           cosign verify-attestation --type spdxjson \
             --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
             "$FRONTEND_IMAGE@$FRONTEND_DIGEST" > evidence/release/frontend-sbom-verify.json
+          ./scripts/verify-release-attestations.py \
+            --provenance evidence/release/backend-provenance-verify.json \
+            --sbom evidence/release/backend-sbom-verify.json \
+            --image-ref "$BACKEND_IMAGE@$BACKEND_DIGEST" \
+            --commit-sha "$GITHUB_SHA" \
+            --certificate-identity "$identity"
+          ./scripts/verify-release-attestations.py \
+            --provenance evidence/release/frontend-provenance-verify.json \
+            --sbom evidence/release/frontend-sbom-verify.json \
+            --image-ref "$FRONTEND_IMAGE@$FRONTEND_DIGEST" \
+            --commit-sha "$GITHUB_SHA" \
+            --certificate-identity "$identity"
           python3 - <<'PY'
           import json
           import os

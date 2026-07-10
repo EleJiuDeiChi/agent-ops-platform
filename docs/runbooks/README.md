@@ -80,7 +80,9 @@ Start the one-time setup override only on an uninitialized data volume. The
 supported installation path is the verification wrapper below; direct
 `docker compose up` is prohibited because it can bypass signature and
 attestation verification. Set the exact certificate identity for the release
-tag and the GitHub Actions OIDC issuer:
+tag and the GitHub Actions OIDC issuer. The wrapper requires Cosign 3.1.1,
+validates provenance/SBOM semantics, checks the full Compose topology before
+start, and verifies the resulting runtime allowlist after start:
 
 ```bash
 AIOPS_COSIGN_CERTIFICATE_IDENTITY='https://github.com/OWNER/REPO/.github/workflows/r0-ci.yml@refs/tags/vX.Y.Z' \
@@ -134,9 +136,10 @@ AIOPS_SOURCE_COMMIT="$(git rev-parse HEAD)" \
 ```
 
 When the KVM development machine intentionally has no `.git` directory, run
-the local wrapper instead. It rejects a dirty worktree, creates a signed-source
-archive from the exact commit, transfers only that archive, and invokes the
-same remote gate:
+the local wrapper instead. It rejects a dirty worktree, creates a SHA-256-bound
+archive from the exact commit, transfers only that archive, and invokes the same
+remote gate. The archive is integrity-bound to the authenticated SSH transfer;
+it is not described as independently signed:
 
 ```bash
 ./scripts/run-r0-clean-vm-matrix-devbox.sh

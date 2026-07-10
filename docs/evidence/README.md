@@ -42,6 +42,13 @@ The release job:
 6. verifies the workflow certificate identity and uploads the verification
    JSON plus tag/commit/workflow/digest manifest.
 
+The release workflow and deployment wrapper both run
+`scripts/verify-release-attestations.py` after Cosign verification. The semantic
+gate requires the attested subject digest, exact repository, semantic tag,
+reviewed commit and an allowed BuildKit/GitHub runner identity, plus a non-empty
+SPDX 2.x package document. A correctly signed but unrelated or empty predicate
+is rejected.
+
 Tag, commit, GitHub artifact, OCI attestation and GHCR digest must all agree.
 No release evidence may contain a session secret, TLS key, setup token or LLM
 API key.
@@ -49,8 +56,10 @@ API key.
 Production startup is supported only through
 `scripts/deploy-production.sh`. It rejects mutable tags and performs
 `cosign verify` plus SLSA-provenance and SPDX-SBOM attestation verification for
-both image digests before invoking Compose. A raw `docker compose up` is an
-explicit security bypass and is not an accepted installation path.
+both image digests before invoking Compose. It then applies the same topology
+allowlist before startup and to the resulting containers. A raw
+`docker compose up` is an explicit security bypass and is not an accepted
+installation path.
 
 ## Local remediation evidence boundary
 

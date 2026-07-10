@@ -11,6 +11,14 @@ from typing import Any
 
 
 EXPECTED_USERS = {"backend": "10001:10001", "frontend": "101:101"}
+EXPECTED_LIMITS = {
+    "backend": {"pids": 256, "memory": 1073741824, "nano_cpus": 1_000_000_000},
+    "frontend": {"pids": 128, "memory": 268435456, "nano_cpus": 500_000_000},
+}
+EXPECTED_TMPFS = {
+    "backend": {"rw", "noexec", "nosuid", "nodev", "size=64m", "uid=10001", "gid=10001", "mode=0750"},
+    "frontend": {"rw", "noexec", "nosuid", "nodev", "size=32m", "uid=101", "gid=101", "mode=0750"},
+}
 EXPECTED_SECRET_TARGETS = {
     "backend": {
         "/run/secrets/session_secret",
@@ -48,7 +56,10 @@ def assert_no_forbidden_path(path_value: str, *, label: str) -> None:
 
 
 def assert_service_security(service_name: str, service: dict[str, Any]) -> None:
+    limits = EXPECTED_LIMITS[service_name]
     require(service.get("user") == EXPECTED_USERS[service_name], f"{service_name} user drifted")
+    require(service.get("init") is True, f"{service_name} must use an init process")
+    require(service.get("restart") == "unless-stopped", f"{service_name} restart policy drifted")
     require(service.get("read_only") is True, f"{service_name} root filesystem must be read-only")
     require(not service.get("privileged", False), f"{service_name} must not be privileged")
     require(not service.get("cap_add"), f"{service_name} CapAdd must be empty")
@@ -61,6 +72,12 @@ def assert_service_security(service_name: str, service: dict[str, Any]) -> None:
     require(service.get("ipc") != "host", f"{service_name} must not use host IPC namespace")
     require(service.get("network_mode") != "host", f"{service_name} must not use host network")
     require(not service.get("devices"), f"{service_name} must not expose host devices")
+    require(service.get("pids_limit") == limits["pids"], f"{service_name} PID limit drifted")
+    require(int(service.get("mem_limit") or 0) == limits["memory"], f"{service_name} memory limit drifted")
+    require(int(float(service.get("cpus") or 0) * 1_000_000_000) == limits["nano_cpus"], f"{service_name} CPU limit drifted")
+    tmpfs = service.get("tmpfs") or []
+    require(len(tmpfs) == 1 and tmpfs[0].startswith("/tmp:"), f"{service_name} tmpfs allowlist drifted")
+    require(set(tmpfs[0].split(":", 1)[1].split(",")) == EXPECTED_TMPFS[service_name], f"{service_name} tmpfs security options drifted")
 
 
 def image_digest(image_ref: str) -> str:
@@ -71,7 +88,7 @@ def image_digest(image_ref: str) -> str:
     return image_ref if image_ref.startswith("sha256:") else image_ref.rsplit("@", 1)[1]
 
 
-def assert_compose(payload: dict[str, Any], *, setup: bool, https_port: str) -> None:
+def assert_compose(payload: dict[str, Any], *, setup: bool, https_port: str, https_bind: str) -> None:
     services = payload.get("services") or {}
     require(set(services) == {"backend", "frontend"}, "production Compose service allowlist drifted")
 
@@ -109,7 +126,7 @@ def assert_compose(payload: dict[str, Any], *, setup: bool, https_port: str) -> 
     published = frontend_ports[0]
     require(published.get("target") == 8443, "frontend container port must be 8443")
     require(str(published.get("published")) == https_port, "frontend published port drifted")
-    require(published.get("host_ip") == "127.0.0.1", "test topology must bind HTTPS to loopback")
+    require(published.get("host_ip") == https_bind, "frontend HTTPS bind address drifted")
     require(published.get("protocol") == "tcp", "frontend HTTPS must use TCP")
 
     for service_name, service in services.items():
@@ -123,7 +140,9 @@ def assert_compose(payload: dict[str, Any], *, setup: bool, https_port: str) -> 
         assert_no_forbidden_path(secret.get("file", ""), label=f"secret {secret_name} source")
 
 
-def assert_runtime(payload: list[dict[str, Any]], *, https_port: str) -> None:
+def assert_runtime(
+    payload: list[dict[str, Any]], *, setup: bool, https_port: str, https_bind: str
+) -> None:
     by_service: dict[str, dict[str, Any]] = {}
     for container in payload:
         labels = (container.get("Config") or {}).get("Labels") or {}
@@ -145,10 +164,13 @@ def assert_runtime(payload: list[dict[str, Any]], *, https_port: str) -> None:
             "/run/secrets/tls_key": ("bind", False),
         },
     }
+    if setup:
+        expected_mounts["backend"]["/run/secrets/setup_token"] = ("bind", False)
 
     for service_name, container in by_service.items():
         config = container.get("Config") or {}
         host = container.get("HostConfig") or {}
+        limits = EXPECTED_LIMITS[service_name]
         configured_image = str(config.get("Image") or "")
         configured_digest = image_digest(configured_image)
         if configured_image.startswith("sha256:"):
@@ -157,6 +179,8 @@ def assert_runtime(payload: list[dict[str, Any]], *, https_port: str) -> None:
                 f"{service_name} runtime image ID drifted",
             )
         require(config.get("User") == EXPECTED_USERS[service_name], f"{service_name} runtime user drifted")
+        require(host.get("Init") is True, f"{service_name} runtime init process drifted")
+        require((host.get("RestartPolicy") or {}).get("Name") == "unless-stopped", f"{service_name} runtime restart policy drifted")
         require(host.get("ReadonlyRootfs") is True, f"{service_name} runtime rootfs must be read-only")
         require(host.get("Privileged") is False, f"{service_name} runtime must not be privileged")
         require(not host.get("CapAdd"), f"{service_name} runtime CapAdd must be empty")
@@ -170,6 +194,11 @@ def assert_runtime(payload: list[dict[str, Any]], *, https_port: str) -> None:
         require(host.get("NetworkMode") != "host", f"{service_name} runtime uses host network")
         require(not host.get("Devices"), f"{service_name} runtime exposes host devices")
         require(not host.get("DeviceRequests"), f"{service_name} runtime requests devices")
+        require(host.get("PidsLimit") == limits["pids"], f"{service_name} runtime PID limit drifted")
+        require(host.get("Memory") == limits["memory"], f"{service_name} runtime memory limit drifted")
+        require(host.get("NanoCpus") == limits["nano_cpus"], f"{service_name} runtime CPU limit drifted")
+        tmpfs_options = set(str((host.get("Tmpfs") or {}).get("/tmp") or "").split(","))
+        require(tmpfs_options == EXPECTED_TMPFS[service_name], f"{service_name} runtime tmpfs security options drifted")
 
         env_names = {item.split("=", 1)[0] for item in config.get("Env") or []}
         require("AIOPS_SESSION_SECRET" not in env_names, "direct session secret leaked into environment")
@@ -201,7 +230,7 @@ def assert_runtime(payload: list[dict[str, Any]], *, https_port: str) -> None:
     require(set(frontend_bindings) == {"8443/tcp"}, "frontend runtime port allowlist drifted")
     binding_rows = frontend_bindings["8443/tcp"] or []
     require(len(binding_rows) == 1, "frontend must have one HTTPS binding")
-    require(binding_rows[0].get("HostIp") == "127.0.0.1", "runtime HTTPS must bind loopback")
+    require(binding_rows[0].get("HostIp") == https_bind, "runtime HTTPS bind address drifted")
     require(binding_rows[0].get("HostPort") == https_port, "runtime HTTPS host port drifted")
 
 
@@ -213,16 +242,29 @@ def main() -> int:
     compose_parser.add_argument("json_path", type=Path)
     compose_parser.add_argument("--setup", action="store_true")
     compose_parser.add_argument("--https-port", required=True)
+    compose_parser.add_argument("--https-bind", default="127.0.0.1")
 
     runtime_parser = subparsers.add_parser("runtime")
     runtime_parser.add_argument("json_path", type=Path)
+    runtime_parser.add_argument("--setup", action="store_true")
     runtime_parser.add_argument("--https-port", required=True)
+    runtime_parser.add_argument("--https-bind", default="127.0.0.1")
 
     args = parser.parse_args()
     if args.command == "compose":
-        assert_compose(load_json(args.json_path), setup=args.setup, https_port=args.https_port)
+        assert_compose(
+            load_json(args.json_path),
+            setup=args.setup,
+            https_port=args.https_port,
+            https_bind=args.https_bind,
+        )
     else:
-        assert_runtime(load_json(args.json_path), https_port=args.https_port)
+        assert_runtime(
+            load_json(args.json_path),
+            setup=args.setup,
+            https_port=args.https_port,
+            https_bind=args.https_bind,
+        )
     print(f"production topology {args.command} assertions passed")
     return 0
 
