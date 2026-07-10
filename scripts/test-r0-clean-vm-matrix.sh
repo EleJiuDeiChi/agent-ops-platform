@@ -108,6 +108,11 @@ prepare_state() {
   if find "$STATE_ROOT/runs" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
     fail "stale agent-ops-r0 run directory exists; clean or archive it before retrying"
   fi
+  if sudo find "$IMAGE_ROOT" -maxdepth 1 -type f \
+      \( -name 'agent-ops-r0-*.qcow2' -o -name 'agent-ops-r0-*-seed.img' \) \
+      -print -quit | grep -q .; then
+    fail "stale agent-ops-r0 VM disk exists without an active run; inspect and clean it before retrying"
+  fi
   mkdir -p "$RUN_DIR"
   : > "$KNOWN_HOSTS"
   chmod 0600 "$KNOWN_HOSTS"

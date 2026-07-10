@@ -117,11 +117,11 @@ def validate_provenance(
                 "provenance is not bound to the reviewed release workflow",
             )
             dependencies = build_definition.get("resolvedDependencies") or []
-            expected_prefix = f"git+https://github.com/{repository}"
+            expected_uri = f"git+https://github.com/{repository}@{ref}"
             require(
                 any(
                     isinstance(item, dict)
-                    and str(item.get("uri") or "").startswith(expected_prefix)
+                    and item.get("uri") == expected_uri
                     and (item.get("digest") or {}).get("gitCommit") == commit
                     for item in dependencies
                 ),
@@ -256,30 +256,37 @@ def self_test() -> None:
             return
         raise AssertionError(f"semantic verifier accepted {label}")
 
-    padded = json.loads(json.dumps(provenance))
-    padded["subject"][0]["name"] = "ghcr.io/attacker/unrelated"
-    padded_build = padded["predicate"]["buildDefinition"]
-    padded_build["externalParameters"]["workflow"] = {
-        "repository": "https://github.com/attacker/repository",
-        "ref": "refs/tags/v9.9.9",
-        "path": ".github/workflows/evil.yml",
-    }
-    padded_build["resolvedDependencies"] = [
-        {"uri": "git+https://github.com/attacker/repository", "digest": {"gitCommit": "3" * 40}}
-    ]
-    padded["predicate"]["runDetails"]["builder"]["id"] = "https://attacker.invalid/builder"
-    padded["predicate"]["untrustedNote"] = f"{repository} {ref} {commit} buildkit"
-    expect_rejected(
-        lambda: validate_provenance(
-            [padded],
-            image_name="ghcr.io/owner/image",
-            digest=digest,
-            commit=commit,
-            repository=repository,
-            ref=ref,
-        ),
-        "provenance padded with correct values in an unrelated field",
+    def set_path(payload: Any, path: tuple[Any, ...], value: Any) -> None:
+        target = payload
+        for segment in path[:-1]:
+            target = target[segment]
+        target[path[-1]] = value
+
+    mutations = (
+        (("subject", 0, "name"), "ghcr.io/attacker/unrelated", "wrong image subject"),
+        (("predicate", "buildDefinition", "buildType"), "https://attacker.invalid/build", "wrong build type"),
+        (("predicate", "buildDefinition", "externalParameters", "workflow", "repository"), "https://github.com/attacker/repository", "wrong repository"),
+        (("predicate", "buildDefinition", "externalParameters", "workflow", "ref"), "refs/tags/v9.9.9", "wrong ref"),
+        (("predicate", "buildDefinition", "externalParameters", "workflow", "path"), ".github/workflows/evil.yml", "wrong workflow path"),
+        (("predicate", "buildDefinition", "resolvedDependencies", 0, "uri"), f"git+https://github.com/{repository}-attacker@{ref}", "prefix-confusable dependency URI"),
+        (("predicate", "buildDefinition", "resolvedDependencies", 0, "digest", "gitCommit"), "3" * 40, "wrong commit"),
+        (("predicate", "runDetails", "builder", "id"), "https://attacker.invalid/builder", "wrong builder"),
     )
+    for path, value, label in mutations:
+        invalid = json.loads(json.dumps(provenance))
+        set_path(invalid, path, value)
+        invalid["predicate"]["untrustedNote"] = f"{repository} {ref} {commit} {GITHUB_HOSTED_BUILDER}"
+        expect_rejected(
+            lambda invalid=invalid: validate_provenance(
+                [invalid],
+                image_name="ghcr.io/owner/image",
+                digest=digest,
+                commit=commit,
+                repository=repository,
+                ref=ref,
+            ),
+            label,
+        )
 
     empty_spdx = json.loads(json.dumps(spdx))
     empty_spdx["predicate"]["packages"] = [{}]
