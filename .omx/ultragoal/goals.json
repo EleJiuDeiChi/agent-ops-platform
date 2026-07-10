@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-07-10T06:35:58.699Z",
-  "updatedAt": "2026-07-10T06:55:25.462Z",
+  "updatedAt": "2026-07-10T14:21:43.190Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -11,11 +11,13 @@
       "id": "G001-r0-production-baseline",
       "title": "R0 Production Baseline",
       "objective": "实施生产范围冻结、Ubuntu/依赖/浏览器/LLM 支持矩阵、生产配置 fail-closed、setup enrollment、健康探针、测试与发布基线。以 PRD Step 0 和 Test Spec R0/GA-R0-001/002 为唯一验收依据；当前 mutation 保持 disabled。",
-      "status": "in_progress",
+      "status": "failed",
       "attempt": 1,
       "createdAt": "2026-07-10T06:35:58.699Z",
-      "updatedAt": "2026-07-10T06:36:10.039Z",
-      "startedAt": "2026-07-10T06:36:10.039Z"
+      "updatedAt": "2026-07-10T14:21:43.190Z",
+      "startedAt": "2026-07-10T06:36:10.039Z",
+      "failedAt": "2026-07-10T14:21:43.190Z",
+      "failureReason": "Repository-local R0 baseline passed at candidate commit 74afd4b38dee385dd5d9f99696a6f374db55d373 using clean-host matrix run 20260710121613-3439748 across Ubuntu 22.04/24.04 and ext4/xfs, with 52 backend tests per variant, production Compose lifecycle, 8/8 evidence hashes, zero per-run residue, and independent reviews at P0=P1=P2=0. Completion is externally blocked: no approved live LLM account/API key plus AI/security/privacy owner approvals, and no authorized GitHub owner/repository/visibility or protected remote release evidence for GHCR digest, Trivy, Cosign, SLSA and signed SPDX."
     },
     {
       "id": "G002-r1-agent-boundary",
@@ -83,6 +85,5 @@
       "updatedAt": "2026-07-10T06:35:58.699Z"
     }
   ],
-  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",
-  "activeGoalId": "G001-r0-production-baseline"
+  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
 }
