@@ -1,14 +1,13 @@
-FROM python:3.12.13-slim-trixie
+FROM python:3.12-alpine3.23
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
 
-RUN apt-get update \
-    && apt-get upgrade --yes --no-install-recommends \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid 10001 aiops \
-    && useradd --uid 10001 --gid 10001 --create-home --home-dir /home/aiops --shell /usr/sbin/nologin aiops
+RUN apk upgrade --no-cache \
+    && addgroup --system --gid 10001 aiops \
+    && adduser --system --uid 10001 --ingroup aiops --home /home/aiops \
+        --shell /sbin/nologin aiops
 
 WORKDIR /app
 
