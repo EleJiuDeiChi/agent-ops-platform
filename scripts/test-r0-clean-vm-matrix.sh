@@ -246,17 +246,18 @@ download_verified_cloud_image() {
   gpgv --status-fd 1 --keyring "$CLOUD_KEYRING" "$signature" "$sums" \
     >"$gpg_status" 2>/dev/null || \
     fail "Ubuntu signature verification failed for $release SHA256SUMS"
-  python3 - "$gpg_status" "$CLOUD_SIGNING_SUBKEY_FINGERPRINT" "$CLOUD_KEY_FINGERPRINT" <<'PY'
+  python3 - "$gpg_status" "$CLOUD_SIGNING_SUBKEY_FINGERPRINT" "$CLOUD_KEY_FINGERPRINT" <<'PY' || \
+    fail "Ubuntu SHA256SUMS signer did not match the pinned primary/subkey policy"
 import sys
 from pathlib import Path
 
-status_path, expected_signer, expected_primary = sys.argv[1:]
+status_path, expected_subkey, expected_primary = sys.argv[1:]
 valid = []
 for line in Path(status_path).read_text(encoding="utf-8").splitlines():
     fields = line.split()
     if len(fields) >= 3 and fields[:2] == ["[GNUPG:]", "VALIDSIG"]:
         valid.append((fields[2], fields[-1]))
-if valid != [(expected_signer, expected_primary)]:
+if len(valid) != 1 or valid[0][0] not in {expected_primary, expected_subkey} or valid[0][1] != expected_primary:
     raise SystemExit(f"unexpected Ubuntu SHA256SUMS signer: {valid!r}")
 PY
   checksum_line="$(grep -E "[ *]${filename}$" "$sums")"
@@ -682,7 +683,9 @@ sanitize_and_power_off_vm() {
 scan_current_evidence_for_secrets() {
   python3 - "$RUN_LOG" \
     "$EVIDENCE_DIR/agent-ops-r0-ubuntu2204-$RUN_ID.log" \
-    "$EVIDENCE_DIR/agent-ops-r0-ubuntu2404-$RUN_ID.log" <<'PY'
+    "$EVIDENCE_DIR/agent-ops-r0-ubuntu2404-$RUN_ID.log" \
+    "$EVIDENCE_DIR/agent-ops-r0-ubuntu2204.json" \
+    "$EVIDENCE_DIR/agent-ops-r0-ubuntu2404.json" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -800,6 +803,9 @@ main() {
   require_host
   prepare_state
   trap cleanup_on_exit EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   prepare_source
   build_diagnostic_images
   push_release_images
