@@ -72,8 +72,6 @@ services:
     cpus: 0.5
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=32m,uid=101,gid=101,mode=0750
-    volumes:
-      - ./nginx.prod.conf:/etc/nginx/conf.d/default.conf:ro
     secrets:
       - tls_cert
       - tls_key

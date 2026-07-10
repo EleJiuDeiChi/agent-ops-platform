@@ -94,16 +94,7 @@ def assert_compose(payload: dict[str, Any], *, setup: bool, https_port: str) -> 
         ],
         "backend volume allowlist drifted",
     )
-    frontend_volumes = frontend.get("volumes") or []
-    require(len(frontend_volumes) == 1, "frontend must have exactly one config bind")
-    frontend_config = frontend_volumes[0]
-    require(frontend_config.get("type") == "bind", "frontend config must be a bind mount")
-    require(
-        frontend_config.get("target") == "/etc/nginx/conf.d/default.conf",
-        "frontend config target drifted",
-    )
-    require(frontend_config.get("read_only") is True, "frontend config bind must be read-only")
-    require(Path(frontend_config.get("source", "")).name == "nginx.prod.conf", "frontend bind source drifted")
+    require(not frontend.get("volumes"), "production frontend config must be embedded in the image")
 
     backend_secret_targets = {item["target"] for item in backend.get("secrets") or []}
     expected_backend_secrets = set(EXPECTED_SECRET_TARGETS["backend"])
@@ -150,7 +141,6 @@ def assert_runtime(payload: list[dict[str, Any]], *, https_port: str) -> None:
             "/run/secrets/llm_evidence": ("bind", False),
         },
         "frontend": {
-            "/etc/nginx/conf.d/default.conf": ("bind", False),
             "/run/secrets/tls_cert": ("bind", False),
             "/run/secrets/tls_key": ("bind", False),
         },

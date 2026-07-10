@@ -11,8 +11,9 @@ RUN npm run build
 
 FROM nginx:1.28.3-alpine3.23 AS runtime
 
+ARG NGINX_SITE_CONFIG=nginx.prod.conf
 COPY deploy/nginx.conf /etc/nginx/nginx.conf
-COPY deploy/nginx.dev.conf /etc/nginx/conf.d/default.conf
+COPY deploy/${NGINX_SITE_CONFIG} /etc/nginx/conf.d/default.conf
 COPY --from=build --chown=nginx:nginx /build/dist /usr/share/nginx/html
 
 RUN mkdir -p /tmp/client_temp /tmp/proxy_temp /tmp/fastcgi_temp \

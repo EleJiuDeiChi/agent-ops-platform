@@ -70,12 +70,18 @@ grep -q '^USER 10001:10001$' "$ROOT_DIR/backend/Dockerfile.test"
 grep -q '^USER 101:101$' "$ROOT_DIR/frontend/Dockerfile"
 grep -q 'npm ci' "$ROOT_DIR/frontend/Dockerfile"
 grep -q 'npm run build' "$ROOT_DIR/frontend/Dockerfile"
+grep -q '^ARG NGINX_SITE_CONFIG=nginx.prod.conf$' "$ROOT_DIR/frontend/Dockerfile"
+grep -q 'NGINX_SITE_CONFIG: nginx.dev.conf' "$ROOT_DIR/docker-compose.yml"
 grep -q 'chmod 0644 /etc/nginx/nginx.conf /etc/nginx/conf.d/default.conf' "$ROOT_DIR/frontend/Dockerfile"
 if grep -Eq 'npm run dev|vite preview' "$ROOT_DIR/frontend/Dockerfile"; then
   echo "frontend runtime must not use a development server" >&2
   exit 1
 fi
 grep -q 'proxy_pass http://backend:8080' "$ROOT_DIR/deploy/nginx.prod.conf"
+if grep -q '/etc/nginx/conf.d/default.conf' "$ROOT_DIR/deploy/compose.prod.yml"; then
+  echo "production Nginx config must be embedded in the immutable frontend image" >&2
+  exit 1
+fi
 grep -q 'AIOPS_SESSION_SECRET_FILE: /run/secrets/session_secret' "$ROOT_DIR/deploy/compose.prod.yml"
 grep -q 'AIOPS_LLM_API_KEY_FILE: /run/secrets/llm_api_key' "$ROOT_DIR/deploy/compose.prod.yml"
 grep -q 'AIOPS_LLM_EVIDENCE_FILE: /run/secrets/llm_evidence' "$ROOT_DIR/deploy/compose.prod.yml"

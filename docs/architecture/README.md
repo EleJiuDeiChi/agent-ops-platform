@@ -15,7 +15,8 @@ Browser
           -> local SQLite volume
 ```
 
-The production frontend terminates TLS, serves the immutable Vite build and
+The production frontend image embeds the reviewed Nginx production config,
+terminates TLS, serves the immutable Vite build and
 proxies API/health traffic by Compose service name. The backend is not
 published on a host port. Neither container mounts the Docker socket, an Agent
 socket, `/proc`, `/run/systemd`, or the host root filesystem.

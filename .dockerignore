@@ -29,3 +29,4 @@ frontend/*
 deploy/*
 !deploy/nginx.conf
 !deploy/nginx.dev.conf
+!deploy/nginx.prod.conf
