@@ -10,7 +10,7 @@ import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -20,7 +20,11 @@ import httpx
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "backend"))
 
-from app.ai.provider_profiles import get_provider_profile  # noqa: E402
+from app.ai.provider_profiles import (  # noqa: E402
+    PROVIDER_PROFILES,
+    LLMProviderProfile,
+    get_provider_profile,
+)
 
 
 RELEASE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -37,12 +41,14 @@ class ProbeError(RuntimeError):
 
 
 def _secret_from_environment(provider_id: str) -> str:
-    provider_by_name = {
-        "AIOPS_LLM_API_KEY": None,
-        "AIOPS_DEEPSEEK_API_KEY": "deepseek",
-        "AIOPS_MOONSHOT_API_KEY": "moonshot",
-        "AIOPS_ZHIPU_API_KEY": "zhipu",
-    }
+    provider_by_name = {"AIOPS_LLM_API_KEY": None}
+    provider_by_name.update(
+        {
+            profile.api_key_variable: profile_id
+            for profile_id, profile in PROVIDER_PROFILES.items()
+            if profile.api_key_variable
+        }
+    )
     direct_values = [
         (name, owner, os.getenv(name))
         for name, owner in provider_by_name.items()
@@ -80,6 +86,19 @@ def _required_environment(name: str) -> str:
     return value
 
 
+def _validate_provider_feature_flag(provider_id: str) -> None:
+    raw = _required_environment("AIOPS_LLM_ENABLED_PROVIDERS")
+    enabled = {
+        item.strip().lower()
+        for item in raw.split(",")
+        if item.strip()
+    }
+    if enabled != {provider_id}:
+        raise ProbeError(
+            "AIOPS_LLM_ENABLED_PROVIDERS must contain exactly AIOPS_LLM_MODE"
+        )
+
+
 def _parse_timestamp(value: Any, *, field: str) -> datetime:
     try:
         timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -93,24 +112,45 @@ def _parse_timestamp(value: Any, *, field: str) -> datetime:
 def _positive_decimal(value: Any, *, field: str, allow_zero: bool = False) -> Decimal:
     try:
         parsed = Decimal(str(value))
-    except Exception as exc:  # Decimal exposes multiple conversion exceptions.
+    except (InvalidOperation, ValueError) as exc:
         raise ProbeError(f"{field} must be numeric") from exc
+    if not parsed.is_finite():
+        raise ProbeError(f"{field} must be finite")
     if parsed < 0 or (parsed == 0 and not allow_zero):
         raise ProbeError(f"{field} must be {'non-negative' if allow_zero else 'positive'}")
     return parsed
 
 
+def _validated_https_source_url(value: Any, *, field: str) -> str:
+    source_url = str(value or "").strip()
+    parsed = urlparse(source_url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ProbeError(
+            f"{field} must be a credential-free HTTPS URL without query/fragment"
+        )
+    return source_url
+
+
 def _load_policy(
     path: Path,
     snapshot_path: Path,
+    quota_pricing_snapshot_path: Path,
     *,
     provider_id: str,
 ) -> tuple[dict[str, Any], str]:
     try:
         policy = json.loads(path.read_text(encoding="utf-8"))
         snapshot = snapshot_path.read_bytes()
+        quota_pricing_snapshot = quota_pricing_snapshot_path.read_bytes()
     except (OSError, json.JSONDecodeError) as exc:
-        raise ProbeError("policy and snapshot files must be readable") from exc
+        raise ProbeError("policy and evidence snapshot files must be readable") from exc
     if not isinstance(policy, dict):
         raise ProbeError("policy file must contain a JSON object")
     required_strings = (
@@ -124,6 +164,10 @@ def _load_policy(
         "provider_policy_url",
         "provider_policy_sha256",
         "reviewed_at",
+        "quota_pricing_source_url",
+        "quota_pricing_snapshot_sha256",
+        "quota_pricing_reviewed_at",
+        "account_tier",
         "currency",
     )
     missing = [name for name in required_strings if not str(policy.get(name) or "").strip()]
@@ -137,9 +181,18 @@ def _load_policy(
         raise ProbeError("policy file must approve redacted operational data only")
 
     reviewed_at = _parse_timestamp(policy["reviewed_at"], field="reviewed_at")
+    quota_pricing_reviewed_at = _parse_timestamp(
+        policy["quota_pricing_reviewed_at"],
+        field="quota_pricing_reviewed_at",
+    )
     now = datetime.now(timezone.utc)
     if reviewed_at > now + timedelta(minutes=5) or now - reviewed_at > timedelta(days=90):
         raise ProbeError("provider policy review must be current within 90 days")
+    if (
+        quota_pricing_reviewed_at > now + timedelta(minutes=5)
+        or now - quota_pricing_reviewed_at > timedelta(days=30)
+    ):
+        raise ProbeError("quota and pricing review must be current within 30 days")
 
     approvals = policy.get("owner_approvals")
     if not isinstance(approvals, dict):
@@ -157,20 +210,82 @@ def _load_policy(
     if actual_digest != expected_digest:
         raise ProbeError("provider policy snapshot does not match provider_policy_sha256")
 
+    _validated_https_source_url(
+        policy["quota_pricing_source_url"],
+        field="quota_pricing_source_url",
+    )
+    expected_quota_pricing_digest = str(
+        policy["quota_pricing_snapshot_sha256"]
+    ).lower()
+    if not POLICY_DIGEST_RE.fullmatch(expected_quota_pricing_digest):
+        raise ProbeError(
+            "quota_pricing_snapshot_sha256 must use sha256:<64 lowercase hex> format"
+        )
+    actual_quota_pricing_digest = (
+        f"sha256:{hashlib.sha256(quota_pricing_snapshot).hexdigest()}"
+    )
+    if actual_quota_pricing_digest != expected_quota_pricing_digest:
+        raise ProbeError(
+            "quota and pricing snapshot does not match quota_pricing_snapshot_sha256"
+        )
+
     for field in (
         "connect_timeout_seconds",
         "read_timeout_seconds",
+        "cache_hit_input_cost_per_million_tokens",
         "input_cost_per_million_tokens",
         "output_cost_per_million_tokens",
         "cost_cap_per_probe",
     ):
         _positive_decimal(policy.get(field), field=field, allow_zero="cost_" in field)
     max_retries = policy.get("max_retries")
-    if not isinstance(max_retries, int) or not 0 <= max_retries <= 3:
+    if (
+        not isinstance(max_retries, int)
+        or isinstance(max_retries, bool)
+        or not 0 <= max_retries <= 3
+    ):
         raise ProbeError("max_retries must be an integer from 0 through 3")
     max_output_tokens = policy.get("max_output_tokens")
-    if not isinstance(max_output_tokens, int) or not 1 <= max_output_tokens <= 512:
+    if (
+        not isinstance(max_output_tokens, int)
+        or isinstance(max_output_tokens, bool)
+        or not 1 <= max_output_tokens <= 512
+    ):
         raise ProbeError("max_output_tokens must be an integer from 1 through 512")
+    max_input_tokens_per_probe = policy.get("max_input_tokens_per_probe")
+    if (
+        not isinstance(max_input_tokens_per_probe, int)
+        or isinstance(max_input_tokens_per_probe, bool)
+        or not 1 <= max_input_tokens_per_probe <= 4096
+    ):
+        raise ProbeError(
+            "max_input_tokens_per_probe must be an integer from 1 through 4096"
+        )
+    quota = policy.get("quota")
+    if not isinstance(quota, dict):
+        raise ProbeError("quota must be an object")
+    for field in (
+        "concurrency_limit",
+        "requests_per_minute",
+        "tokens_per_minute",
+        "tokens_per_day",
+    ):
+        value = quota.get(field)
+        if not (
+            (isinstance(value, int) and not isinstance(value, bool) and value > 0)
+            or (
+                isinstance(value, str)
+                and value in {"unlimited", "provider-managed", "account-tier"}
+            )
+        ):
+            raise ProbeError(
+                f"quota.{field} must be a positive integer or an approved provider limit marker"
+            )
+    _positive_decimal(
+        quota.get("balance_alert_threshold"),
+        field="quota.balance_alert_threshold",
+        allow_zero=True,
+    )
     return policy, actual_digest
 
 
@@ -183,27 +298,77 @@ def _model_ids(payload: Any) -> list[str]:
     return ids
 
 
-def _verify_live_policy_snapshot(policy: dict[str, Any], *, timeout: float) -> None:
-    policy_url = str(policy["provider_policy_url"])
-    parsed = urlparse(policy_url)
-    if (
-        parsed.scheme != "https"
-        or not parsed.netloc
-        or parsed.username
-        or parsed.password
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ProbeError("provider_policy_url must be a credential-free HTTPS URL without query/fragment")
+def _validate_response_model(payload: Any, configured_model: str) -> None:
+    if not isinstance(payload, dict) or payload.get("model") != configured_model:
+        raise ProbeError("provider response model does not match configured model")
+
+
+def _validate_stream_content_type(value: str) -> str:
+    normalized = value.split(";", 1)[0].strip().lower()
+    if normalized != "text/event-stream":
+        raise ProbeError("streaming response Content-Type must be text/event-stream")
+    return normalized
+
+
+def _validate_stream_event(
+    chunk: Any,
+    configured_model: str,
+    provider_id: str,
+) -> tuple[str, tuple[int, int, int] | None]:
+    if not isinstance(chunk, dict) or chunk.get("error") is not None:
+        raise ProbeError("stream returned an error or invalid event object")
+    _validate_response_model(chunk, configured_model)
+    choices = chunk.get("choices")
+    if not isinstance(choices, list):
+        raise ProbeError("stream event is missing choices")
+    content = ""
+    if choices:
+        first_choice = choices[0]
+        delta = first_choice.get("delta") if isinstance(first_choice, dict) else None
+        if not isinstance(delta, dict):
+            raise ProbeError("stream event delta is invalid")
+        raw_content = delta.get("content")
+        if raw_content is not None and not isinstance(raw_content, str):
+            raise ProbeError("stream event content is invalid")
+        content = raw_content or ""
+    raw_usage = chunk.get("usage")
+    if raw_usage is None and choices and isinstance(choices[0], dict):
+        raw_usage = choices[0].get("usage")
+    usage = None
+    if raw_usage is not None:
+        usage = _usage({"usage": raw_usage}, provider_id=provider_id)
+    if not choices and usage is None:
+        raise ProbeError("stream event has neither choices nor usage")
+    return content, usage
+
+
+def _validate_stream_contract(
+    content: str,
+    usage: tuple[int, int, int] | None,
+) -> None:
+    if "R0_STREAM_OK" not in content:
+        raise ProbeError("stream did not contain the required contract marker")
+    if usage is None:
+        raise ProbeError("stream did not report token usage")
+
+
+def _verify_live_snapshot(
+    source_url: Any,
+    expected_digest: Any,
+    *,
+    timeout: float,
+    label: str,
+) -> None:
+    url = _validated_https_source_url(source_url, field=f"{label}_url")
     try:
-        response = httpx.get(policy_url, timeout=timeout, follow_redirects=True)
+        response = httpx.get(url, timeout=timeout, follow_redirects=True)
     except httpx.TransportError as exc:
-        raise ProbeError("provider policy URL could not be retrieved") from exc
+        raise ProbeError(f"{label} URL could not be retrieved") from exc
     if response.status_code >= 400:
-        raise ProbeError(f"provider policy URL returned HTTP {response.status_code}")
+        raise ProbeError(f"{label} URL returned HTTP {response.status_code}")
     live_digest = f"sha256:{hashlib.sha256(response.content).hexdigest()}"
-    if live_digest != str(policy["provider_policy_sha256"]).lower():
-        raise ProbeError("live provider policy no longer matches the reviewed snapshot hash")
+    if live_digest != str(expected_digest).lower():
+        raise ProbeError(f"live {label} no longer matches the reviewed snapshot hash")
 
 
 def _validate_tool_call(message: Any) -> tuple[str, dict[str, Any]]:
@@ -288,20 +453,140 @@ def _request_json(
     raise ProbeError(f"{request_name} failed") from last_error
 
 
-def _usage(payload: Any) -> tuple[int, int]:
+def _usage(
+    payload: Any,
+    *,
+    provider_id: str,
+) -> tuple[int, int, int]:
     usage = payload.get("usage") if isinstance(payload, dict) else None
     if not isinstance(usage, dict):
         raise ProbeError("provider response did not include token usage")
     prompt_tokens = usage.get("prompt_tokens")
     completion_tokens = usage.get("completion_tokens")
-    if not isinstance(prompt_tokens, int) or not isinstance(completion_tokens, int):
+    if (
+        not isinstance(prompt_tokens, int)
+        or isinstance(prompt_tokens, bool)
+        or not isinstance(completion_tokens, int)
+        or isinstance(completion_tokens, bool)
+    ):
         raise ProbeError("provider token usage fields are invalid")
-    return prompt_tokens, completion_tokens
+    profile = get_provider_profile(provider_id)
+    cached_tokens: Any = 0
+    if profile.cache_usage_format == "deepseek_cache_fields":
+        cached_tokens = usage.get("prompt_cache_hit_tokens")
+        cache_miss_tokens = usage.get("prompt_cache_miss_tokens")
+        if (
+            not isinstance(cached_tokens, int)
+            or isinstance(cached_tokens, bool)
+            or cached_tokens < 0
+            or not isinstance(cache_miss_tokens, int)
+            or isinstance(cache_miss_tokens, bool)
+            or cache_miss_tokens < 0
+        ):
+            raise ProbeError("DeepSeek cache-miss token usage is invalid")
+        if cached_tokens + cache_miss_tokens != prompt_tokens:
+            raise ProbeError("DeepSeek cache token usage does not sum to prompt_tokens")
+    elif profile.cache_usage_format == "kimi_cached_tokens":
+        cached_tokens = usage.get("cached_tokens")
+    elif profile.cache_usage_format == "prompt_tokens_details":
+        details = usage.get("prompt_tokens_details")
+        if not isinstance(details, dict):
+            raise ProbeError("provider prompt token details are invalid")
+        cached_tokens = details.get("cached_tokens")
+    else:
+        raise ProbeError("provider cache usage format is unsupported")
+    if not isinstance(cached_tokens, int) or isinstance(cached_tokens, bool):
+        raise ProbeError("provider cached token usage is invalid")
+    if (
+        prompt_tokens < 0
+        or completion_tokens < 0
+        or cached_tokens < 0
+        or cached_tokens > prompt_tokens
+    ):
+        raise ProbeError("provider token usage values are invalid")
+    return prompt_tokens, cached_tokens, completion_tokens
+
+
+def _estimated_cost(
+    *,
+    input_tokens: int,
+    cached_input_tokens: int,
+    output_tokens: int,
+    input_rate: Decimal,
+    cached_input_rate: Decimal,
+    output_rate: Decimal,
+) -> Decimal:
+    cache_miss_tokens = input_tokens - cached_input_tokens
+    return (
+        Decimal(cache_miss_tokens) * input_rate
+        + Decimal(cached_input_tokens) * cached_input_rate
+        + Decimal(output_tokens) * output_rate
+    ) / Decimal(1_000_000)
+
+
+def _enforce_cost_cap(cost: Decimal, cap: Decimal, *, phase: str) -> None:
+    if cost > cap:
+        raise ProbeError(f"{phase} live-probe cost exceeds approved cap")
+
+
+def _probe_payloads(
+    profile: LLMProviderProfile,
+    *,
+    model: str,
+    max_output_tokens: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    tool_payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Call probe_echo exactly once with value "
+                    "r0-live-contract-probe."
+                ),
+            }
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "probe_echo",
+                    "description": "Return a fixed contract probe value.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ],
+        "tool_choice": (
+            {"type": "function", "function": {"name": "probe_echo"}}
+            if profile.supports_named_tool_choice
+            else "auto"
+        ),
+        "max_tokens": min(64, max_output_tokens),
+        "stream": False,
+    }
+    stream_payload: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": "Reply with R0_STREAM_OK."}],
+        "max_tokens": min(32, max_output_tokens),
+        "stream": True,
+    }
+    if profile.supports_thinking:
+        tool_payload["thinking"] = {"type": "disabled"}
+        stream_payload["thinking"] = {"type": "disabled"}
+    if profile.supports_stream_usage_option:
+        stream_payload["stream_options"] = {"include_usage": True}
+    return tool_payload, stream_payload
 
 
 def run_probe(
     policy_path: Path,
     snapshot_path: Path,
+    quota_pricing_snapshot_path: Path,
     *,
     output_path: Path,
     validity_hours: int,
@@ -311,6 +596,14 @@ def run_probe(
         profile = get_provider_profile(provider_id)
     except ValueError as exc:
         raise ProbeError(str(exc)) from exc
+    required_capabilities = {
+        "streaming": profile.supports_streaming,
+        "tool_calls": profile.supports_tool_calls,
+        "usage_reporting": profile.reports_usage,
+    }
+    if not all(required_capabilities.values()):
+        raise ProbeError("provider profile does not declare the complete R0 live contract")
+    _validate_provider_feature_flag(provider_id)
     base_url = _required_environment("AIOPS_LLM_BASE_URL").rstrip("/")
     model = _required_environment("AIOPS_LLM_MODEL")
     release_digest = _required_environment("AIOPS_RELEASE_DIGEST").lower()
@@ -326,15 +619,65 @@ def run_probe(
     policy, policy_digest = _load_policy(
         policy_path,
         snapshot_path,
+        quota_pricing_snapshot_path,
         provider_id=provider_id,
     )
     connect_timeout = float(policy["connect_timeout_seconds"])
     read_timeout = float(policy["read_timeout_seconds"])
     max_retries = int(policy["max_retries"])
     max_output_tokens = int(policy["max_output_tokens"])
+    max_input_tokens_per_probe = int(policy["max_input_tokens_per_probe"])
+    input_rate = Decimal(str(policy["input_cost_per_million_tokens"]))
+    cached_input_rate = Decimal(
+        str(policy["cache_hit_input_cost_per_million_tokens"])
+    )
+    output_rate = Decimal(str(policy["output_cost_per_million_tokens"]))
+    cost_cap = Decimal(str(policy["cost_cap_per_probe"]))
+    tool_payload, stream_payload = _probe_payloads(
+        profile,
+        model=model,
+        max_output_tokens=max_output_tokens,
+    )
+    tool_attempt_budget = max_retries + 1
+    tool_payload_byte_bound = len(
+        json.dumps(tool_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    )
+    stream_payload_byte_bound = len(
+        json.dumps(stream_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    )
+    input_payload_byte_upper_bound = (
+        tool_payload_byte_bound * tool_attempt_budget + stream_payload_byte_bound
+    )
+    if input_payload_byte_upper_bound > max_input_tokens_per_probe:
+        raise ProbeError(
+            "serialized live-probe payload byte bound exceeds max_input_tokens_per_probe"
+        )
+    preflight_cost = _estimated_cost(
+        input_tokens=input_payload_byte_upper_bound,
+        cached_input_tokens=0,
+        output_tokens=(
+            int(tool_payload["max_tokens"]) * tool_attempt_budget
+            + int(stream_payload["max_tokens"])
+        ),
+        input_rate=input_rate,
+        cached_input_rate=cached_input_rate,
+        output_rate=output_rate,
+    )
+    _enforce_cost_cap(preflight_cost, cost_cap, phase="worst-case preflight")
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     attempts: dict[str, int] = {}
-    _verify_live_policy_snapshot(policy, timeout=connect_timeout)
+    _verify_live_snapshot(
+        policy["provider_policy_url"],
+        policy["provider_policy_sha256"],
+        timeout=connect_timeout,
+        label="provider policy",
+    )
+    _verify_live_snapshot(
+        policy["quota_pricing_source_url"],
+        policy["quota_pricing_snapshot_sha256"],
+        timeout=connect_timeout,
+        label="quota and pricing source",
+    )
 
     seed = "api_key=R0_SEEDED_SECRET_MUST_NOT_LEAVE_PROCESS"
     captured = _redact_for_capture(seed)
@@ -359,29 +702,6 @@ def run_probe(
             if model not in model_ids:
                 raise ProbeError("configured model is not present in authenticated model discovery")
 
-        probe_value = "r0-live-contract-probe"
-        tool_payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": "Call probe_echo exactly once with value r0-live-contract-probe."}],
-            "tools": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "probe_echo",
-                        "description": "Return a fixed contract probe value.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {"value": {"type": "string"}},
-                            "required": ["value"],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            ],
-            "tool_choice": {"type": "function", "function": {"name": "probe_echo"}},
-            "max_tokens": min(64, max_output_tokens),
-            "stream": False,
-        }
         tool_response = _request_json(
             client,
             "POST",
@@ -391,11 +711,15 @@ def run_probe(
             request_name="tool_call",
             json=tool_payload,
         ).json()
+        _validate_response_model(tool_response, model)
         choices = tool_response.get("choices") if isinstance(tool_response, dict) else None
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             raise ProbeError("chat completion returned no choices")
         name, arguments = _validate_tool_call(choices[0].get("message"))
-        input_tokens, output_tokens = _usage(tool_response)
+        tool_input_tokens, tool_cached_input_tokens, tool_output_tokens = _usage(
+            tool_response,
+            provider_id=provider_id,
+        )
         discovery_content = (
             models_response.content
             if models_response is not None
@@ -404,44 +728,87 @@ def run_probe(
         if models_response is None:
             attempts["model_discovery"] = attempts["tool_call"]
 
-        stream_payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": "Reply with R0_STREAM_OK."}],
-            "max_tokens": min(32, max_output_tokens),
-            "stream": True,
-        }
         stream_chunks = 0
         stream_done = False
+        stream_content: list[str] = []
+        stream_usage: tuple[int, int, int] | None = None
+        normalized_stream_events: list[str] = []
+        stream_content_type = ""
         attempts["streaming"] = 1
         with client.stream("POST", f"{base_url}{profile.chat_path}", json=stream_payload) as response:
             if response.status_code >= 400:
                 raise ProbeError(f"streaming request failed with HTTP {response.status_code}")
+            stream_content_type = _validate_stream_content_type(
+                response.headers.get("content-type", "")
+            )
             for line in response.iter_lines():
                 if not line.startswith("data:"):
                     continue
                 data = line.removeprefix("data:").strip()
                 if data == "[DONE]":
                     stream_done = True
+                    normalized_stream_events.append("data:[DONE]")
                     break
                 try:
                     chunk = json.loads(data)
                 except json.JSONDecodeError as exc:
                     raise ProbeError("stream returned invalid JSON data") from exc
-                if isinstance(chunk, dict):
-                    stream_chunks += 1
+                content, event_usage = _validate_stream_event(
+                    chunk,
+                    model,
+                    provider_id,
+                )
+                normalized_stream_events.append(
+                    "data:"
+                    + json.dumps(
+                        chunk,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+                if content:
+                    stream_content.append(content)
+                if event_usage is not None:
+                    stream_usage = event_usage
+                stream_chunks += 1
         if stream_chunks == 0 or not stream_done:
             raise ProbeError("stream did not provide JSON chunks followed by [DONE]")
+        _validate_stream_contract("".join(stream_content), stream_usage)
 
-    input_rate = Decimal(str(policy["input_cost_per_million_tokens"]))
-    output_rate = Decimal(str(policy["output_cost_per_million_tokens"]))
-    estimated_cost = (Decimal(input_tokens) * input_rate + Decimal(output_tokens) * output_rate) / Decimal(1_000_000)
-    cost_cap = Decimal(str(policy["cost_cap_per_probe"]))
-    if estimated_cost > cost_cap:
-        raise ProbeError("estimated live-probe cost exceeds approved cap")
+    normalized_stream_capture = "\n".join(normalized_stream_events).encode("utf-8")
+    stream_capture_sha256 = f"sha256:{hashlib.sha256(normalized_stream_capture).hexdigest()}"
+
+    stream_input_tokens, stream_cached_input_tokens, stream_output_tokens = stream_usage
+    input_tokens = tool_input_tokens + stream_input_tokens
+    cached_input_tokens = tool_cached_input_tokens + stream_cached_input_tokens
+    output_tokens = tool_output_tokens + stream_output_tokens
+    if input_tokens > input_payload_byte_upper_bound:
+        raise ProbeError("actual live-probe input tokens exceed the approved preflight bound")
+    successful_response_cost = _estimated_cost(
+        input_tokens=input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        output_tokens=output_tokens,
+        input_rate=input_rate,
+        cached_input_rate=cached_input_rate,
+        output_rate=output_rate,
+    )
+    prior_tool_attempts = max(0, attempts["tool_call"] - 1)
+    retry_cost_upper_bound = _estimated_cost(
+        input_tokens=tool_payload_byte_bound * prior_tool_attempts,
+        cached_input_tokens=0,
+        output_tokens=int(tool_payload["max_tokens"]) * prior_tool_attempts,
+        input_rate=input_rate,
+        cached_input_rate=cached_input_rate,
+        output_rate=output_rate,
+    )
+    estimated_cost = successful_response_cost + retry_cost_upper_bound
+    _enforce_cost_cap(estimated_cost, cost_cap, phase="aggregate actual")
 
     now = datetime.now(timezone.utc)
     discovery_hash = hashlib.sha256(discovery_content).hexdigest()
     required_checks = {
+        "feature_flag": True,
         "model_discovery": True,
         "tool_call": True,
         "streaming": True,
@@ -449,6 +816,7 @@ def run_probe(
         "timeout_retry": True,
         "redaction_capture": True,
         "usage_cost": True,
+        "quota_pricing_snapshot": True,
         "policy_snapshot": True,
         "owner_approvals": True,
     }
@@ -462,8 +830,13 @@ def run_probe(
         "release_digest": release_digest,
         "evidence_path": str(output_path),
         "provider_id": provider_id,
+        "feature_flag": {
+            "enabled_provider_id": provider_id,
+            "exclusive": True,
+        },
         "provider_origin": base_url,
         "model": model,
+        "provider_capabilities": required_capabilities,
         "account_identifier": policy["account_identifier"],
         "region": policy["region"],
         "model_discovery": {
@@ -477,7 +850,14 @@ def run_probe(
             "unknown_tool_rejected": True,
             "extra_field_rejected": True,
         },
-        "stream": {"json_chunks": stream_chunks, "done_received": stream_done},
+        "stream": {
+            "json_chunks": stream_chunks,
+            "done_received": stream_done,
+            "contract_marker_received": True,
+            "usage_reported": True,
+            "content_type": stream_content_type,
+            "normalized_events_sha256": stream_capture_sha256,
+        },
         "timeout_retry": {
             "connect_timeout_seconds": connect_timeout,
             "read_timeout_seconds": read_timeout,
@@ -491,10 +871,30 @@ def run_probe(
         },
         "usage_cost": {
             "input_tokens": input_tokens,
+            "cached_input_tokens": cached_input_tokens,
+            "cache_miss_input_tokens": input_tokens - cached_input_tokens,
             "output_tokens": output_tokens,
             "estimated_cost": str(estimated_cost),
+            "successful_responses_estimated_cost": str(successful_response_cost),
+            "retry_cost_upper_bound": str(retry_cost_upper_bound),
+            "preflight_worst_case_cost": str(preflight_cost),
+            "max_input_tokens_per_probe": max_input_tokens_per_probe,
+            "input_payload_byte_upper_bound": input_payload_byte_upper_bound,
+            "tool_attempt_budget": tool_attempt_budget,
             "currency": policy["currency"],
             "approved_cap": str(cost_cap),
+            "rates_per_million_tokens": {
+                "cache_hit_input": str(policy["cache_hit_input_cost_per_million_tokens"]),
+                "cache_miss_input": str(policy["input_cost_per_million_tokens"]),
+                "output": str(policy["output_cost_per_million_tokens"]),
+            },
+        },
+        "quota": policy["quota"],
+        "quota_pricing_evidence": {
+            "account_tier": policy["account_tier"],
+            "source_url": policy["quota_pricing_source_url"],
+            "snapshot_sha256": policy["quota_pricing_snapshot_sha256"],
+            "reviewed_at": policy["quota_pricing_reviewed_at"],
         },
         "policy": {
             "region": policy["region"],
@@ -552,6 +952,7 @@ def main() -> int:
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--policy-file", type=Path)
     parser.add_argument("--policy-snapshot-file", type=Path)
+    parser.add_argument("--quota-pricing-snapshot-file", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--validity-hours", type=int, default=24)
     args = parser.parse_args()
@@ -563,8 +964,16 @@ def main() -> int:
             return 1
         print("LLM contract probe self-test passed")
         return 0
-    if args.policy_file is None or args.policy_snapshot_file is None or args.output is None:
-        parser.error("--policy-file, --policy-snapshot-file and --output are required for a live probe")
+    if (
+        args.policy_file is None
+        or args.policy_snapshot_file is None
+        or args.quota_pricing_snapshot_file is None
+        or args.output is None
+    ):
+        parser.error(
+            "--policy-file, --policy-snapshot-file, "
+            "--quota-pricing-snapshot-file and --output are required for a live probe"
+        )
     if not 1 <= args.validity_hours <= 72:
         print("LLM contract probe failed: --validity-hours must be from 1 through 72", file=sys.stderr)
         return 1
@@ -572,6 +981,7 @@ def main() -> int:
         manifest = run_probe(
             args.policy_file,
             args.policy_snapshot_file,
+            args.quota_pricing_snapshot_file,
             output_path=args.output,
             validity_hours=args.validity_hours,
         )

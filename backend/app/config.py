@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlparse
 
-from app.ai.provider_profiles import LIVE_PROVIDER_IDS, get_provider_profile
+from app.ai.provider_profiles import (
+    LIVE_PROVIDER_IDS,
+    PROVIDER_PROFILES,
+    get_provider_profile,
+)
 
 
 class ConfigurationError(RuntimeError):
@@ -129,6 +133,8 @@ class Settings:
     llm_base_url_configured: bool
     llm_model: str | None
     llm_model_configured: bool
+    llm_enabled_providers: frozenset[str]
+    llm_enabled_providers_configured: bool
     llm_api_key: str | None = field(repr=False)
     llm_api_key_configured: bool = False
     llm_evidence_file: Path | None = None
@@ -201,6 +207,14 @@ class Settings:
             raise ConfigurationError(str(exc)) from exc
         if not self.llm_model_configured or not self.llm_model:
             raise ConfigurationError("production requires explicit AIOPS_LLM_MODEL")
+        if not self.llm_enabled_providers_configured:
+            raise ConfigurationError(
+                "production requires explicit AIOPS_LLM_ENABLED_PROVIDERS"
+            )
+        if self.llm_enabled_providers != frozenset({self.llm_mode}):
+            raise ConfigurationError(
+                "production AIOPS_LLM_ENABLED_PROVIDERS must contain exactly the selected AIOPS_LLM_MODE"
+            )
         if not self.llm_api_key_configured or not self.llm_api_key:
             raise ConfigurationError(
                 "production requires AIOPS_LLM_API_KEY or AIOPS_LLM_API_KEY_FILE"
@@ -237,6 +251,24 @@ def load_settings(
         raise ConfigurationError("AIOPS_ENV must be dev, test, or prod") from exc
 
     llm_mode = env.get("AIOPS_LLM_MODE", "mock").strip().lower() or "mock"
+    enabled_providers_configured = "AIOPS_LLM_ENABLED_PROVIDERS" in env
+    enabled_providers_raw = env.get("AIOPS_LLM_ENABLED_PROVIDERS")
+    if enabled_providers_raw is None:
+        enabled_providers = (
+            frozenset({llm_mode}) if llm_mode in LIVE_PROVIDER_IDS else frozenset()
+        )
+    else:
+        enabled_providers = frozenset(
+            item.strip().lower()
+            for item in enabled_providers_raw.split(",")
+            if item.strip()
+        )
+        unknown_providers = enabled_providers - LIVE_PROVIDER_IDS
+        if unknown_providers:
+            unknown = ", ".join(sorted(unknown_providers))
+            raise ConfigurationError(
+                f"AIOPS_LLM_ENABLED_PROVIDERS contains unsupported providers: {unknown}"
+            )
     session_secret, session_secret_configured = _secret_value(env, "AIOPS_SESSION_SECRET")
     if session_secret is None:
         session_secret = (
@@ -250,12 +282,12 @@ def load_settings(
     )
     setup_token, setup_token_configured = _secret_value(env, "AIOPS_SETUP_TOKEN")
     key_sources = []
-    for variable, provider_id in (
-        ("AIOPS_LLM_API_KEY", None),
-        ("AIOPS_DEEPSEEK_API_KEY", "deepseek"),
-        ("AIOPS_MOONSHOT_API_KEY", "moonshot"),
-        ("AIOPS_ZHIPU_API_KEY", "zhipu"),
-    ):
+    provider_key_sources = [
+        (str(profile.api_key_variable), provider_id)
+        for provider_id, profile in PROVIDER_PROFILES.items()
+        if profile.api_key_variable
+    ]
+    for variable, provider_id in [("AIOPS_LLM_API_KEY", None), *provider_key_sources]:
         value, configured = _secret_value(env, variable)
         if configured:
             key_sources.append((variable, provider_id, value))
@@ -338,6 +370,8 @@ def load_settings(
         llm_base_url_configured="AIOPS_LLM_BASE_URL" in env,
         llm_model=env.get("AIOPS_LLM_MODEL"),
         llm_model_configured="AIOPS_LLM_MODEL" in env,
+        llm_enabled_providers=enabled_providers,
+        llm_enabled_providers_configured=enabled_providers_configured,
         llm_api_key=llm_api_key,
         llm_api_key_configured=llm_api_key_configured,
         llm_evidence_file=(

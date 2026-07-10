@@ -23,6 +23,14 @@ All third-party GitHub Actions are pinned to immutable commit SHAs with their
 reviewed tag recorded as a comment. Updating a tag requires reviewing and
 changing the SHA.
 
+The R0 load-tool decision is recorded in
+`docs/architecture/adr-0001-load-harness.md`. The production Compose gate runs
+20 bounded concurrent health requests through the pinned httpx harness and
+validates its `GA-R0-LOAD-TOOL` manifest. This proves harness operation only;
+it is not the later GA-PERF-001 or 100-stream SSE performance result.
+Branch CI archives the manifest under `evidence/r0/load-smoke.json`; signed
+release CI archives the exact-digest run under `evidence/release/load-smoke.json`.
+
 ## Protected release evidence
 
 Only an immutable `vMAJOR.MINOR.PATCH` tag can enter the `release` job. The job
@@ -58,6 +66,17 @@ is rejected.
 Tag, commit, GitHub artifact, OCI attestation and GHCR digest must all agree.
 No release evidence may contain a session secret, TLS key, setup token or LLM
 API key.
+
+The release `manifest.json` also follows the Test Spec execution contract. It
+contains `test_id=GA-R0-002`, requirement, automation, environment, fixture,
+sample, expected result, evidence path, owner, one canonical `release_digest`
+(the backend/control-plane digest), `release_digests` for both deployable
+images, and `result=passed`. Missing fixed fields mean the release gate was not
+executed even if individual Cosign commands succeeded.
+The release job stages and validates the complete bundle at
+`.omx/evidence/production-ga/GA-R0-002/` before artifact upload; a non-canonical
+path, missing fixed field, non-digest release binding or non-passing result is
+rejected by `scripts/validate-ga-manifest.py`.
 
 Production startup is supported only through
 `scripts/deploy-production.sh`. It rejects mutable tags and performs

@@ -7,7 +7,11 @@ from typing import Any
 import httpx
 
 from app.config import Settings, load_settings
-from app.ai.provider_profiles import LIVE_PROVIDER_IDS, LLMProviderProfile, get_provider_profile
+from app.ai.provider_profiles import (
+    LIVE_PROVIDER_IDS,
+    LLMProviderProfile,
+    get_provider_profile,
+)
 from app.ai.redaction import configured_secrets, redact_for_provider, redact_text
 
 
@@ -26,7 +30,7 @@ def llm_mode(settings: Settings | None = None) -> str:
 
 def llm_enabled(settings: Settings | None = None) -> bool:
     settings = _provider_settings(settings)
-    return settings.llm_mode in LIVE_PROVIDER_IDS and bool(
+    return settings.llm_mode in settings.llm_enabled_providers and bool(
         settings.llm_api_key and settings.llm_base_url and settings.llm_model
     )
 
@@ -91,6 +95,14 @@ class OpenAICompatibleChatProvider:
             if self.thinking == "enabled" and self.profile.supports_reasoning_effort:
                 payload["reasoning_effort"] = self.reasoning_effort
         if tools:
+            if not self.profile.supports_tool_calls:
+                raise LLMProviderError(
+                    f"{self.profile.display_name} tool calling is not enabled by its provider profile"
+                )
+            if isinstance(tool_choice, dict) and not self.profile.supports_named_tool_choice:
+                raise LLMProviderError(
+                    f"{self.profile.display_name} does not support named tool choice"
+                )
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice or "auto"
         elif tool_choice:

@@ -89,6 +89,7 @@ jobs:
           AIOPS_IMAGE_TAG: r0-ci
           AIOPS_TEST_HTTPS_PORT: "55443"
           AIOPS_RUN_PRODUCTION_PLAYWRIGHT: "1"
+          AIOPS_LOAD_EVIDENCE_FILE: evidence/r0/load-smoke.json
         run: ./scripts/test-production-compose.sh
 
       - name: Install Syft 1.46.0
@@ -269,6 +270,7 @@ jobs:
           AIOPS_COMMIT_SHA: ${{ github.sha }}
           AIOPS_TEST_HTTPS_PORT: "55443"
           AIOPS_RUN_PRODUCTION_PLAYWRIGHT: "1"
+          AIOPS_LOAD_EVIDENCE_FILE: evidence/release/load-smoke.json
         run: |
           set -euo pipefail
           docker pull "$AIOPS_BACKEND_IMAGE_REF"
@@ -420,27 +422,48 @@ jobs:
             --image-ref "$FRONTEND_IMAGE@$FRONTEND_DIGEST" \
             --commit-sha "$GITHUB_SHA" \
             --certificate-identity "$identity"
+          canonical_evidence_dir=".omx/evidence/production-ga/GA-R0-002"
+          mkdir -p "$canonical_evidence_dir"
+          cp -a evidence/release/. "$canonical_evidence_dir/"
           python3 - <<'PY'
           import json
           import os
           from pathlib import Path
 
           payload = {
+              "test_id": "GA-R0-002",
+              "requirement": "immutable build context, SBOM, signature, provenance, and zero HIGH/CRITICAL findings",
+              "automation": ".github/workflows/r0-ci.yml protected release job",
+              "environment": "GitHub Actions production-release environment",
+              "fixture_or_seed": os.environ["GITHUB_SHA"],
+              "sample_size_or_duration": "one two-image immutable semantic-version release",
+              "expected": "both exact image digests are scanned, signed, attested, and semantically verified",
+              "evidence_path": ".omx/evidence/production-ga/GA-R0-002/",
+              "owner": "release lead",
+              "release_digest": os.environ["BACKEND_DIGEST"],
+              "release_digests": {
+                  "backend": os.environ["BACKEND_DIGEST"],
+                  "frontend": os.environ["FRONTEND_DIGEST"],
+              },
+              "result": "passed",
               "release_tag": os.environ["GITHUB_REF_NAME"],
               "commit_sha": os.environ["GITHUB_SHA"],
               "workflow_ref": os.environ["GITHUB_WORKFLOW_REF"],
               "backend": {"image": os.environ["BACKEND_IMAGE"], "digest": os.environ["BACKEND_DIGEST"]},
               "frontend": {"image": os.environ["FRONTEND_IMAGE"], "digest": os.environ["FRONTEND_DIGEST"]},
           }
-          Path("evidence/release/manifest.json").write_text(
+          Path(".omx/evidence/production-ga/GA-R0-002/manifest.json").write_text(
               json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
           )
           PY
+          ./scripts/validate-ga-manifest.py \
+            .omx/evidence/production-ga/GA-R0-002/manifest.json
 
       - name: Upload protected release evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: signed-release-${{ github.ref_name }}-${{ github.run_id }}
-          path: evidence/release/
+          path: .omx/evidence/production-ga/GA-R0-002/
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 90

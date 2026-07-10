@@ -4,6 +4,10 @@ This document is the R0 architecture truth source required by
 `.omx/plans/prd-agent-ops-production-ga-20260710.md` Step 0 and
 `.omx/plans/test-spec-agent-ops-production-ga-20260710.md` section 4.
 
+Architecture decisions:
+
+- [ADR-0001: pinned httpx load harness](adr-0001-load-harness.md)
+
 ## Current R0 topology
 
 ```text

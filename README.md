@@ -42,6 +42,7 @@
 
 ```bash
 export AIOPS_LLM_MODE=deepseek
+export AIOPS_LLM_ENABLED_PROVIDERS=deepseek
 export AIOPS_LLM_API_KEY_FILE="/仅后端可读的路径/llm_api_key"
 export AIOPS_LLM_BASE_URL="https://api.deepseek.com"
 export AIOPS_LLM_MODEL="deepseek-v4-flash"

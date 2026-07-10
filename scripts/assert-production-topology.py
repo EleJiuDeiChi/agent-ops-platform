@@ -104,6 +104,11 @@ def assert_compose(payload: dict[str, Any], *, setup: bool, https_port: str, htt
         backend_environment.get("AIOPS_RELEASE_DIGEST") == backend_digest,
         "backend release digest must match its immutable image reference",
     )
+    require(
+        backend_environment.get("AIOPS_LLM_ENABLED_PROVIDERS")
+        == backend_environment.get("AIOPS_LLM_MODE"),
+        "production must enable exactly its selected LLM provider",
+    )
     require(not backend.get("ports"), "backend must not publish host ports")
     require(
         backend.get("volumes") == [
@@ -215,6 +220,11 @@ def assert_runtime(
             require(
                 environment.get("AIOPS_RELEASE_DIGEST") == configured_digest,
                 "backend runtime release digest does not match configured image",
+            )
+            require(
+                environment.get("AIOPS_LLM_ENABLED_PROVIDERS")
+                == environment.get("AIOPS_LLM_MODE"),
+                "backend runtime must enable exactly its selected LLM provider",
             )
 
         actual_mounts: dict[str, tuple[str, bool]] = {}

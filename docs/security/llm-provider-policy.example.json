@@ -11,6 +11,10 @@
   "provider_policy_url": "REPLACE_WITH_EXACT_PROVIDER_POLICY_HTTPS_URL",
   "provider_policy_sha256": "sha256:REPLACE_WITH_64_HEX_CHARACTERS",
   "reviewed_at": "REPLACE_WITH_UTC_ISO8601",
+  "quota_pricing_source_url": "REPLACE_WITH_EXACT_PROVIDER_QUOTA_OR_PRICING_HTTPS_URL",
+  "quota_pricing_snapshot_sha256": "sha256:REPLACE_WITH_64_HEX_CHARACTERS",
+  "quota_pricing_reviewed_at": "REPLACE_WITH_UTC_ISO8601",
+  "account_tier": "REPLACE_WITH_REVIEWED_ACCOUNT_TIER",
   "owner_approvals": {
     "ai": {"approved": false, "approved_at": "REPLACE_WITH_UTC_ISO8601"},
     "security": {"approved": false, "approved_at": "REPLACE_WITH_UTC_ISO8601"},
@@ -20,8 +24,17 @@
   "read_timeout_seconds": 60,
   "max_retries": 1,
   "max_output_tokens": 128,
+  "max_input_tokens_per_probe": 4096,
+  "cache_hit_input_cost_per_million_tokens": "REPLACE_WITH_REVIEWED_RATE_OR_ZERO",
   "input_cost_per_million_tokens": "REPLACE_WITH_REVIEWED_RATE",
   "output_cost_per_million_tokens": "REPLACE_WITH_REVIEWED_RATE",
   "cost_cap_per_probe": "REPLACE_WITH_APPROVED_CAP",
-  "currency": "CNY"
+  "currency": "CNY",
+  "quota": {
+    "concurrency_limit": "REPLACE_WITH_POSITIVE_INTEGER_OR_ACCOUNT_TIER",
+    "requests_per_minute": "REPLACE_WITH_POSITIVE_INTEGER_OR_PROVIDER_MANAGED",
+    "tokens_per_minute": "REPLACE_WITH_POSITIVE_INTEGER_OR_PROVIDER_MANAGED",
+    "tokens_per_day": "REPLACE_WITH_POSITIVE_INTEGER_OR_UNLIMITED",
+    "balance_alert_threshold": "REPLACE_WITH_NON_NEGATIVE_AMOUNT"
+  }
 }

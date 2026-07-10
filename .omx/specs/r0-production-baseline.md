@@ -63,8 +63,9 @@ Release verdict is `NO-GO` if any item is true:
    frozen, or an unsupported environment attempts mutation. Full browser and
    database domain support remain separate R5/R4 gates and must stay
    `TARGET`/disabled until their own evidence exists.
-8. DeepSeek/OpenAI-compatible `/models`, tool calling, redaction, region,
-   retention/training opt-out and owner approvals are incomplete.
+8. The selected OpenAI-compatible provider's provider-specific discovery,
+   tool calling, redaction, region, retention/training decision, exclusive
+   release flag and owner approvals are incomplete.
 9. Runtime/dependency/container scans have P0/P1 findings, or signed digest,
    SBOM and provenance are missing for a claimed release.
 10. Root repository has no protected `main`, release/tag policy or auditable

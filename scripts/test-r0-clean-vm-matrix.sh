@@ -730,6 +730,7 @@ run_vm_gate() {
   local expected_data_filesystem="${12}"
   local log="$EVIDENCE_DIR/$evidence_name-$RUN_ID.log"
   local manifest="$EVIDENCE_DIR/$evidence_name.json"
+  local load_manifest="$EVIDENCE_DIR/$evidence_name-load.json"
   local raw_log_path=".omx/evidence/production-ga/GA-R0-001/$evidence_name-$RUN_ID.log"
   local -a options pipeline_status
   mapfile -t options < <(ssh_args)
@@ -776,12 +777,16 @@ AIOPS_PYTHON_BIN="$python_wrapper" ./scripts/verify-production-baseline.sh
 rm -f "$python_wrapper"
 mkdir -p .omx/evidence/production-ga/GA-R0-001
 storage_evidence_path=".omx/evidence/production-ga/GA-R0-001/${AIOPS_EVIDENCE_NAME}-storage.json"
+load_evidence_path=".omx/evidence/production-ga/GA-R0-001/${AIOPS_EVIDENCE_NAME}-load.json"
 AIOPS_RUN_PRODUCTION_PLAYWRIGHT=0 AIOPS_PRESERVE_ON_FAILURE=1 \
   AIOPS_EXPECTED_DATA_FILESYSTEM="$AIOPS_EXPECTED_DATA_FILESYSTEM" \
   AIOPS_DATA_FILESYSTEM_EVIDENCE_FILE="$storage_evidence_path" \
+  AIOPS_LOAD_EVIDENCE_FILE="$load_evidence_path" \
   ./scripts/test-production-compose.sh
 [ -f "$storage_evidence_path" ] || { echo "SQLite storage evidence was not written" >&2; exit 1; }
+[ -f "$load_evidence_path" ] || { echo "load evidence was not written" >&2; exit 1; }
 export AIOPS_DATA_FILESYSTEM_EVIDENCE_FILE="$storage_evidence_path"
+export AIOPS_LOAD_EVIDENCE_FILE="$load_evidence_path"
 export AIOPS_BACKEND_CONFIG_ID="$(docker image inspect agent-ops-backend:r0-ci --format '{{.Id}}')"
 export AIOPS_FRONTEND_CONFIG_ID="$(docker image inspect agent-ops-frontend:r0-ci --format '{{.Id}}')"
 export AIOPS_DOCKER_VERSION="$(docker version --format '{{.Server.Version}}')"
@@ -799,6 +804,7 @@ from pathlib import Path
 
 name = os.environ["AIOPS_EVIDENCE_NAME"]
 sqlite_storage = json.loads(Path(os.environ["AIOPS_DATA_FILESYSTEM_EVIDENCE_FILE"]).read_text(encoding="utf-8"))
+load_smoke = json.loads(Path(os.environ["AIOPS_LOAD_EVIDENCE_FILE"]).read_text(encoding="utf-8"))
 payload = {
     "test_id": "GA-R0-001",
     "requirement": "clean Ubuntu x86_64 production fail-closed, setup, health and topology gate",
@@ -829,6 +835,7 @@ payload = {
     "docker_root_dir": os.environ["AIOPS_DOCKER_ROOT_DIR"],
     "docker_storage_driver": os.environ["AIOPS_DOCKER_STORAGE_DRIVER"],
     "sqlite_storage": sqlite_storage,
+    "load_smoke": load_smoke,
     "docker_engine": os.environ["AIOPS_DOCKER_VERSION"],
     "docker_compose": os.environ["AIOPS_COMPOSE_VERSION"],
     "docker_ce_package": os.environ["AIOPS_DOCKER_CE_PACKAGE"],
@@ -853,7 +860,9 @@ REMOTE
   [ "${pipeline_status[1]}" -eq 0 ] || fail "$name evidence log could not be written"
   chmod 0600 "$log"
   scp "${options[@]}" "aiops@$ip:/home/aiops/agent-ops/.omx/evidence/production-ga/GA-R0-001/$evidence_name.json" "$manifest"
+  scp "${options[@]}" "aiops@$ip:/home/aiops/agent-ops/.omx/evidence/production-ga/GA-R0-001/$evidence_name-load.json" "$load_manifest"
   chmod 0600 "$manifest"
+  chmod 0600 "$load_manifest"
 }
 
 sanitize_and_power_off_vm() {

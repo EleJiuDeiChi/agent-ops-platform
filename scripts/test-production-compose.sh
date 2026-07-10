@@ -6,6 +6,7 @@ TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aiops-prod-compose.XXXXXX")"
 PROJECT_NAME="agent-ops-r0-runtime-${RANDOM}"
 HTTPS_PORT="${AIOPS_TEST_HTTPS_PORT:-55443}"
 PRESERVE_ON_FAILURE="${AIOPS_PRESERVE_ON_FAILURE:-0}"
+LOAD_EVIDENCE_FILE="${AIOPS_LOAD_EVIDENCE_FILE:-}"
 
 export AIOPS_IMAGE_TAG="${AIOPS_IMAGE_TAG:-r0-ci}"
 if [ -z "${AIOPS_BACKEND_IMAGE_REF:-}" ]; then
@@ -37,6 +38,7 @@ export AIOPS_SESSION_SECRET_FILE_HOST="$TMP_DIR/session_secret"
 export AIOPS_TLS_CERT_FILE_HOST="$TMP_DIR/tls_cert.pem"
 export AIOPS_TLS_KEY_FILE_HOST="$TMP_DIR/tls_key.pem"
 export AIOPS_LLM_MODE=deepseek
+export AIOPS_LLM_ENABLED_PROVIDERS=deepseek
 export AIOPS_LLM_BASE_URL=https://api.deepseek.com
 export AIOPS_LLM_MODEL=deepseek-v4-flash
 export AIOPS_LLM_API_KEY_FILE_HOST="$TMP_DIR/llm_api_key"
@@ -94,7 +96,7 @@ openssl rand -hex 32 > "$AIOPS_LLM_API_KEY_FILE_HOST"
 openssl rand -hex 32 > "$AIOPS_SETUP_TOKEN_FILE_HOST"
 SETUP_TOKEN_VALUE="$(tr -d '\r\n' < "$AIOPS_SETUP_TOKEN_FILE_HOST")"
 chmod 600 "$AIOPS_SESSION_SECRET_FILE_HOST" "$AIOPS_LLM_API_KEY_FILE_HOST" "$AIOPS_SETUP_TOKEN_FILE_HOST"
-printf '%s\n' '{"schema_version":1,"result":"fail","reason":"live provider probe intentionally absent in topology test"}' > "$AIOPS_LLM_EVIDENCE_FILE_HOST"
+printf '%s\n' '{"schema_version":2,"result":"fail","reason":"live provider probe intentionally absent in topology test"}' > "$AIOPS_LLM_EVIDENCE_FILE_HOST"
 chmod 444 "$AIOPS_LLM_EVIDENCE_FILE_HOST"
 export AIOPS_LLM_EVIDENCE_SHA256="sha256:$(openssl dgst -sha256 "$AIOPS_LLM_EVIDENCE_FILE_HOST" | awk '{print $NF}')"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=127.0.0.1' \
@@ -177,6 +179,40 @@ rm -f "$AIOPS_SETUP_TOKEN_FILE_HOST"
 "${COMPOSE_PROD[@]}" up -d --no-build
 wait_for_live
 assert_readiness "llm_unverified"
+
+FRONTEND_ID="$("${COMPOSE_PROD[@]}" ps -q frontend)"
+docker run --rm \
+  --network "container:$FRONTEND_ID" \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --pids-limit 64 \
+  --volume "$ROOT_DIR/scripts/run-load-smoke.py:/tmp/run-load-smoke.py:ro" \
+  --entrypoint python \
+  "$AIOPS_BACKEND_IMAGE_REF" \
+  /tmp/run-load-smoke.py \
+  --base-url "https://127.0.0.1:8443" \
+  --path /health/live \
+  --requests 20 \
+  --concurrency 4 \
+  --insecure \
+  --release-digest "$AIOPS_RELEASE_DIGEST" \
+  --evidence-path "${LOAD_EVIDENCE_FILE:-diagnostic-only/load-smoke.json}" \
+  --output - > "$TMP_DIR/load-smoke.json"
+python3 - "$TMP_DIR/load-smoke.json" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+if payload.get("test_id") != "GA-R0-LOAD-TOOL" or payload.get("result") != "passed":
+    raise SystemExit(f"load smoke manifest is invalid: {payload!r}")
+if payload.get("measurements", {}).get("successful_requests") != 20:
+    raise SystemExit(f"load smoke request count is invalid: {payload!r}")
+PY
+if [ -n "$LOAD_EVIDENCE_FILE" ]; then
+  mkdir -p "$(dirname "$LOAD_EVIDENCE_FILE")"
+  install -m 0600 "$TMP_DIR/load-smoke.json" "$LOAD_EVIDENCE_FILE"
+fi
 
 curl -kfsS "https://127.0.0.1:$HTTPS_PORT/version" | python3 -c '
 import json, sys

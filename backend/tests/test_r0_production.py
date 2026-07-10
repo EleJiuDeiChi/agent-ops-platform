@@ -4,6 +4,7 @@ import importlib
 import hashlib
 import json
 import os
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -32,6 +33,7 @@ def production_environment(tmp_path: Path, now: datetime) -> dict[str, str]:
         "AIOPS_SETUP_TOKEN_FILE": str(setup_token_file),
         "AIOPS_SETUP_TOKEN_EXPIRES_AT": (now + timedelta(minutes=30)).isoformat(),
         "AIOPS_LLM_MODE": "openai_compatible",
+        "AIOPS_LLM_ENABLED_PROVIDERS": "openai_compatible",
         "AIOPS_LLM_BASE_URL": "https://llm.example.test/v1",
         "AIOPS_LLM_MODEL": "frozen-production-model",
         "AIOPS_LLM_API_KEY_FILE": str(llm_key_file),
@@ -56,6 +58,7 @@ def apply_environment(monkeypatch: pytest.MonkeyPatch, values: dict[str, str]) -
         "AIOPS_SETUP_TOKEN_FILE",
         "AIOPS_SETUP_TOKEN_EXPIRES_AT",
         "AIOPS_LLM_MODE",
+        "AIOPS_LLM_ENABLED_PROVIDERS",
         "AIOPS_LLM_BASE_URL",
         "AIOPS_LLM_MODEL",
         "AIOPS_LLM_API_KEY",
@@ -86,6 +89,7 @@ def apply_environment(monkeypatch: pytest.MonkeyPatch, values: dict[str, str]) -
         ("AIOPS_TLS_ENABLED", {}, "TLS_ENABLED"),
         (None, {"AIOPS_DEBUG_SKIP_PASSWORD_CHANGE": "1"}, "DEBUG_SKIP"),
         ("AIOPS_LLM_MODE", {}, "LLM_MODE"),
+        ("AIOPS_LLM_ENABLED_PROVIDERS", {}, "LLM_ENABLED_PROVIDERS"),
         ("AIOPS_LLM_BASE_URL", {}, "LLM_BASE_URL"),
         (None, {"AIOPS_LLM_BASE_URL": "http://llm.example.test/v1"}, "credential-free HTTPS"),
         (
@@ -141,6 +145,7 @@ def test_production_accepts_each_built_in_provider_contract(
     env.update(
         {
             "AIOPS_LLM_MODE": provider_id,
+            "AIOPS_LLM_ENABLED_PROVIDERS": provider_id,
             "AIOPS_LLM_BASE_URL": base_url,
             "AIOPS_LLM_MODEL": candidate_model,
         }
@@ -162,6 +167,26 @@ def test_production_rejects_provider_identity_and_origin_mismatch(tmp_path: Path
         }
     )
     with pytest.raises(ConfigurationError, match="Moonshot Kimi production base URL"):
+        load_settings(env, validate=True, current_time=now)
+
+
+@pytest.mark.parametrize(
+    "enabled_providers",
+    ["", "deepseek", "moonshot,zhipu", "unknown-provider"],
+)
+def test_production_requires_exclusive_selected_provider_feature_flag(
+    tmp_path: Path,
+    enabled_providers: str,
+) -> None:
+    now = datetime.now(UTC)
+    env = production_environment(tmp_path, now)
+    env["AIOPS_LLM_ENABLED_PROVIDERS"] = enabled_providers
+    expected = (
+        "unsupported providers"
+        if enabled_providers == "unknown-provider"
+        else "must contain exactly"
+    )
+    with pytest.raises(ConfigurationError, match=expected):
         load_settings(env, validate=True, current_time=now)
 
 
@@ -458,6 +483,28 @@ def test_test_environment_keeps_mock_provider_default(
     assert llm_enabled() is False
 
 
+def test_non_production_provider_can_be_explicitly_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    apply_environment(
+        monkeypatch,
+        {
+            "AIOPS_ENV": "test",
+            "AIOPS_DB_PATH": str(tmp_path / "disabled-provider.sqlite"),
+            "AIOPS_LLM_MODE": "moonshot",
+            "AIOPS_LLM_ENABLED_PROVIDERS": "",
+            "AIOPS_LLM_BASE_URL": "https://api.moonshot.ai/v1",
+            "AIOPS_LLM_MODEL": "kimi-k2.6",
+            "AIOPS_LLM_API_KEY": "test-provider-key",
+        },
+    )
+
+    from app.ai.providers import llm_enabled
+
+    assert llm_enabled() is False
+
+
 def test_version_reports_declared_release_identity_without_authentication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -507,6 +554,10 @@ def provider_evidence_environment(
         "result": "pass",
         "executed_at": now.isoformat(),
         "provider_id": env["AIOPS_LLM_MODE"],
+        "feature_flag": {
+            "enabled_provider_id": env["AIOPS_LLM_MODE"],
+            "exclusive": True,
+        },
         "provider_origin": env["AIOPS_LLM_BASE_URL"],
         "model": env["AIOPS_LLM_MODEL"],
         "release_digest": release_digest,
@@ -515,6 +566,11 @@ def provider_evidence_environment(
         "evidence_path": "test-evidence/llm-evidence.json",
         "account_identifier": "test-account",
         "region": "PRC",
+        "provider_capabilities": {
+            "streaming": True,
+            "tool_calls": True,
+            "usage_reporting": True,
+        },
         "model_discovery": {
             "method": "authenticated_models_endpoint",
             "path": "/models",
@@ -530,7 +586,14 @@ def provider_evidence_environment(
             "unknown_tool_rejected": True,
             "extra_field_rejected": True,
         },
-        "stream": {"json_chunks": 1, "done_received": True},
+        "stream": {
+            "json_chunks": 2,
+            "done_received": True,
+            "contract_marker_received": True,
+            "usage_reported": True,
+            "content_type": "text/event-stream",
+            "normalized_events_sha256": "sha256:" + "f" * 64,
+        },
         "timeout_retry": {
             "connect_timeout_seconds": 10,
             "read_timeout_seconds": 60,
@@ -544,10 +607,36 @@ def provider_evidence_environment(
         },
         "usage_cost": {
             "input_tokens": 10,
+            "cached_input_tokens": 2,
+            "cache_miss_input_tokens": 8,
             "output_tokens": 5,
             "estimated_cost": "0.0001",
+            "successful_responses_estimated_cost": "0.0001",
+            "retry_cost_upper_bound": "0",
+            "preflight_worst_case_cost": "0.001",
+            "max_input_tokens_per_probe": 512,
+            "input_payload_byte_upper_bound": 400,
+            "tool_attempt_budget": 2,
             "approved_cap": "0.01",
             "currency": "CNY",
+            "rates_per_million_tokens": {
+                "cache_hit_input": "0.02",
+                "cache_miss_input": "1",
+                "output": "2",
+            },
+        },
+        "quota": {
+            "concurrency_limit": 2500,
+            "requests_per_minute": "provider-managed",
+            "tokens_per_minute": "provider-managed",
+            "tokens_per_day": "unlimited",
+            "balance_alert_threshold": "10",
+        },
+        "quota_pricing_evidence": {
+            "account_tier": "test-approved-tier",
+            "source_url": "https://provider.example.test/pricing",
+            "snapshot_sha256": "sha256:" + "b" * 64,
+            "reviewed_at": now.isoformat(),
         },
         "policy": {
             "training_opt_out_confirmed": True,
@@ -582,7 +671,13 @@ def provider_evidence_environment(
 @pytest.mark.parametrize(
     ("overrides", "reason_code"),
     [
-        ({"provider_id": "deepseek"}, "llm_evidence_provider_id_mismatch"),
+        (
+            {
+                "provider_id": "deepseek",
+                "feature_flag": {"enabled_provider_id": "deepseek", "exclusive": True},
+            },
+            "llm_evidence_provider_id_mismatch",
+        ),
         ({"provider_origin": "https://different.example.test/v1"}, "llm_evidence_provider_mismatch"),
         ({"model": "different-model"}, "llm_evidence_model_mismatch"),
         ({"release_digest": "sha256:" + "b" * 64}, "llm_evidence_release_mismatch"),
@@ -590,6 +685,45 @@ def provider_evidence_environment(
         ({"runner_identity": ""}, "llm_evidence_contract_incomplete"),
         (
             {"tool_call": {"name": "probe_echo", "schema_match": True}},
+            "llm_evidence_contract_incomplete",
+        ),
+        (
+            {
+                "feature_flag": {
+                    "enabled_provider_id": "openai_compatible",
+                    "exclusive": False,
+                }
+            },
+            "llm_evidence_contract_incomplete",
+        ),
+        ({"quota": {}}, "llm_evidence_contract_incomplete"),
+        (
+            {"quota_pricing_evidence": {"account_tier": "test"}},
+            "llm_evidence_contract_incomplete",
+        ),
+        (
+            {
+                "usage_cost": {
+                    "input_tokens": 1,
+                    "cached_input_tokens": 0,
+                    "cache_miss_input_tokens": 1,
+                    "output_tokens": 1,
+                    "estimated_cost": "Infinity",
+                    "successful_responses_estimated_cost": "Infinity",
+                    "retry_cost_upper_bound": "0",
+                    "preflight_worst_case_cost": "Infinity",
+                    "max_input_tokens_per_probe": 512,
+                    "input_payload_byte_upper_bound": 400,
+                    "tool_attempt_budget": 2,
+                    "approved_cap": "Infinity",
+                    "currency": "CNY",
+                    "rates_per_million_tokens": {
+                        "cache_hit_input": "0",
+                        "cache_miss_input": "1",
+                        "output": "1",
+                    },
+                }
+            },
             "llm_evidence_contract_incomplete",
         ),
         ({"required_checks": {}}, "llm_evidence_checks_incomplete"),
@@ -627,6 +761,20 @@ def test_provider_evidence_requires_protected_file_and_matching_digest(tmp_path:
     assert validate_provider_evidence(settings, current_time=now).reason_code == (
         "llm_evidence_digest_mismatch"
     )
+
+
+def test_provider_evidence_is_bound_to_the_enabled_provider_flag(tmp_path: Path) -> None:
+    from app.ai.verification import validate_provider_evidence
+
+    now = datetime.now(UTC)
+    env, _ = provider_evidence_environment(tmp_path, now)
+    settings = load_settings(env, validate=True, current_time=now)
+    mismatched = replace(
+        settings,
+        llm_enabled_providers=frozenset({"deepseek"}),
+    )
+    result = validate_provider_evidence(mismatched, current_time=now)
+    assert result.reason_code == "llm_evidence_feature_flag_mismatch"
 
 
 def test_verified_provider_evidence_unlocks_readiness_and_diagnosis(

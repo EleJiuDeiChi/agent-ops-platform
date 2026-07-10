@@ -17,6 +17,7 @@ required_files=(
   deploy/nginx.dev.conf
   deploy/nginx.prod.conf
   docs/architecture/README.md
+  docs/architecture/adr-0001-load-harness.md
   docs/runbooks/README.md
   docs/security/llm-provider-policy.example.json
   docs/security/threat-model.md
@@ -25,7 +26,9 @@ required_files=(
   docs/evidence/README.md
   .omx/specs/r0-production-baseline.md
   scripts/probe-llm-contract.py
+  scripts/run-load-smoke.py
   scripts/verify-release-attestations.py
+  scripts/validate-ga-manifest.py
   scripts/deploy-production.sh
   scripts/assert-production-topology.py
   scripts/test-production-compose.sh
@@ -42,11 +45,15 @@ for file in "${required_files[@]}"; do
 done
 
 "$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/probe-llm-contract.py"
+"$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/run-load-smoke.py"
 "$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/assert-production-topology.py"
 "$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/verify-release-attestations.py"
+"$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/validate-ga-manifest.py"
 "$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/generate-r0-matrix-summary.py"
 "$PYTHON_BIN" "$ROOT_DIR/scripts/probe-llm-contract.py" --help >/dev/null
+"$PYTHON_BIN" "$ROOT_DIR/scripts/run-load-smoke.py" --self-test
 "$PYTHON_BIN" "$ROOT_DIR/scripts/verify-release-attestations.py" --self-test
+"$PYTHON_BIN" "$ROOT_DIR/scripts/validate-ga-manifest.py" --self-test
 PYTHONOPTIMIZE=1 "$PYTHON_BIN" "$ROOT_DIR/scripts/generate-r0-matrix-summary.py" --self-test
 "$ROOT_DIR/scripts/deploy-production.sh" --help >/dev/null
 "$ROOT_DIR/scripts/assert-production-topology.py" --help >/dev/null
@@ -95,11 +102,17 @@ if grep -q '/etc/nginx/conf.d/default.conf' "$ROOT_DIR/deploy/compose.prod.yml";
 fi
 grep -q 'AIOPS_SESSION_SECRET_FILE: /run/secrets/session_secret' "$ROOT_DIR/deploy/compose.prod.yml"
 grep -q 'AIOPS_LLM_API_KEY_FILE: /run/secrets/llm_api_key' "$ROOT_DIR/deploy/compose.prod.yml"
+grep -q 'AIOPS_LLM_ENABLED_PROVIDERS:' "$ROOT_DIR/deploy/compose.prod.yml"
 grep -q 'AIOPS_LLM_EVIDENCE_FILE: /run/secrets/llm_evidence' "$ROOT_DIR/deploy/compose.prod.yml"
 grep -q 'cosign verify' "$ROOT_DIR/scripts/deploy-production.sh"
 grep -q 'verify-attestation' "$ROOT_DIR/scripts/deploy-production.sh"
 grep -q 'verify-release-attestations.py' "$ROOT_DIR/scripts/deploy-production.sh"
 grep -q 'assert-production-topology.py' "$ROOT_DIR/scripts/deploy-production.sh"
+grep -q '"test_id": "GA-R0-002"' "$ROOT_DIR/.github/workflows/r0-ci.yml"
+grep -q '"release_digest": os.environ\["BACKEND_DIGEST"\]' "$ROOT_DIR/.github/workflows/r0-ci.yml"
+grep -q '"evidence_path": ".omx/evidence/production-ga/GA-R0-002/"' "$ROOT_DIR/.github/workflows/r0-ci.yml"
+grep -q 'validate-ga-manifest.py' "$ROOT_DIR/.github/workflows/r0-ci.yml"
+grep -q 'include-hidden-files: true' "$ROOT_DIR/.github/workflows/r0-ci.yml"
 grep -q 'up -d --no-build --remove-orphans' "$ROOT_DIR/scripts/deploy-production.sh"
 grep -q 'post-start verification failed; stopping the unverified deployment' "$ROOT_DIR/scripts/deploy-production.sh"
 if grep -Eq 'AIOPS_(SESSION_SECRET|LLM_API_KEY):' "$ROOT_DIR/deploy/compose.prod.yml"; then
@@ -141,6 +154,7 @@ export AIOPS_SESSION_SECRET_FILE_HOST="$TMP_DIR/session_secret"
 export AIOPS_TLS_CERT_FILE_HOST="$TMP_DIR/tls_cert.pem"
 export AIOPS_TLS_KEY_FILE_HOST="$TMP_DIR/tls_key.pem"
 export AIOPS_LLM_MODE=deepseek
+export AIOPS_LLM_ENABLED_PROVIDERS=deepseek
 export AIOPS_LLM_BASE_URL=https://api.deepseek.com
 export AIOPS_LLM_MODEL=deepseek-v4-flash
 export AIOPS_LLM_API_KEY_FILE_HOST="$TMP_DIR/llm_api_key"

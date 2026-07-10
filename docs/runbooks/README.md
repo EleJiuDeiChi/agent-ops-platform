@@ -52,10 +52,19 @@ Before using a live LLM, select one active provider (`deepseek`, `moonshot`, or
 `docs/support-matrix.md`. Evidence is not transferable between providers or
 accounts. A successful HTTP request alone is insufficient.
 
+Set `AIOPS_LLM_ENABLED_PROVIDERS` to exactly the selected `AIOPS_LLM_MODE`.
+This is the provider release flag: production rejects a missing flag, multiple
+providers, an unknown provider, or a provider different from the active mode.
+
 Copy `docs/security/llm-provider-policy.example.json` to a protected working
 file, replace every placeholder, save the exact reviewed provider-policy page
 as a snapshot, and record that snapshot's SHA-256 plus all three owner
-approvals. Set `AIOPS_RELEASE_DIGEST` to the immutable backend image digest and
+approvals. Save a second immutable snapshot of the reviewed account-tier quota
+and pricing source. Record its exact credential-free HTTPS source URL, SHA-256,
+review time and account tier alongside the selected account's concurrency/RPM/TPM/TPD limits,
+balance-alert threshold and cache-hit/cache-miss/output rates; use an explicit
+approved marker only where the provider manages or tiers a limit. Set
+`AIOPS_RELEASE_DIGEST` to the immutable backend image digest and
 `AIOPS_EVIDENCE_RUNNER_IDENTITY` to the accountable operator or CI identity,
 then run:
 
@@ -63,13 +72,18 @@ then run:
 ./scripts/probe-llm-contract.py \
   --policy-file /protected/path/llm-provider-policy.json \
   --policy-snapshot-file /protected/path/provider-policy.snapshot \
+  --quota-pricing-snapshot-file /protected/path/quota-pricing.snapshot \
   --output .omx/evidence/production-ga/GA-R0-001/llm-contract.json
 ```
 
-The probe verifies the live policy URL still hashes to the reviewed snapshot,
-provider-specific authenticated model discovery, exact model, typed tool calling, streaming,
+The probe verifies both live source URLs still hash to their reviewed snapshots,
+provider-specific authenticated model discovery, exact model, typed tool calling, SSE media type,
+contract marker, normalized event hash and provider-specific cache usage,
 bounded timeout/retry, invalid-tool rejection, seeded-secret redaction and
-usage/cost limits. It writes the manifest read-only and prints the exact
+usage/cost limits. The preflight budget uses a conservative serialized-payload
+byte bound and includes every potentially billed tool retry before any provider
+request. The probe also binds those limits to the reviewed quota/pricing snapshot.
+It writes the manifest read-only and prints the exact
 `AIOPS_LLM_EVIDENCE_SHA256` value. Copy the manifest to the protected host path
 configured by `AIOPS_LLM_EVIDENCE_FILE_HOST`; the backend verifies its digest,
 expiry, provider, model and release binding before any production diagnosis can

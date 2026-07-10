@@ -1,6 +1,6 @@
 # R0 production support policy and evidence matrix
 
-Review date: 2026-07-10. This file separates the intended first-GA support
+Review date: 2026-07-11. This file separates the intended first-GA support
 range from evidence actually produced. A version family or image tag is not
 "supported" merely because it is current, documented upstream, or present in
 a Dockerfile. `SUPPORTED` requires the blocking environment manifest and the
@@ -80,11 +80,16 @@ account, origin, model or release digest invalidates the old evidence. Adapter
 support is not a production support claim: all three built-ins remain `TARGET`
 until their own live probe and governance review pass.
 
+`AIOPS_LLM_ENABLED_PROVIDERS` is an exclusive release flag. Production accepts
+exactly the selected `AIOPS_LLM_MODE`; enabling multiple providers or omitting
+the selected provider fails startup. A provider can enter the release flag only
+after its own account, policy and live evidence are approved.
+
 | Provider ID | Candidate model | Frozen production origin | Model confirmation | Provider-specific notes | Status |
 | --- | --- | --- | --- | --- | --- |
-| `deepseek` | `deepseek-v4-flash` | `https://api.deepseek.com` | authenticated `GET /models` | Legacy `deepseek-chat` and `deepseek-reasoner` are ineligible because their announced retirement is 2026-07-24 15:59 UTC. Candidate rates are CNY 1 / 1M cache-miss input and CNY 2 / 1M output tokens. | TARGET |
+| `deepseek` | `deepseek-v4-flash` | `https://api.deepseek.com` | authenticated `GET /models` | Legacy `deepseek-chat` and `deepseek-reasoner` are ineligible because their announced retirement is 2026-07-24 15:59 UTC. The reviewed public page currently lists USD 0.0028 / 1M cache-hit input, USD 0.14 / 1M cache-miss input and USD 0.28 / 1M output; the live probe must still snapshot current rates. | TARGET |
 | `moonshot` | `kimi-k2.6` | `https://api.moonshot.ai/v1` | authenticated `GET /models` | K2.6 supports streaming, thinking and tool calls. Published rates are USD 0.16 / 1M cache-hit input, USD 0.95 / 1M cache-miss input and USD 4 / 1M output tokens. The public privacy policy describes Singapore storage and model-improvement processing, so acceptable enterprise terms or an approved account control are blocking. | TARGET |
-| `zhipu` | `glm-5.2` | `https://open.bigmodel.cn/api/paas/v4` | authenticated `POST /chat/completions` with the exact model | The official API surface documents chat, streaming and Function Call but no OpenAI-shaped model-list endpoint. The authenticated completion response is therefore the discovery evidence. Current price must be captured from the account-visible price page at probe time. | TARGET |
+| `zhipu` | `glm-5.2` | `https://open.bigmodel.cn/api/paas/v4` | authenticated `POST /chat/completions` with the exact model | The official API surface currently enumerates GLM-5.2 and documents chat, streaming, usage, Function Call and GLM-5.2 reasoning effort, but only `tool_choice=auto` and no OpenAI-shaped model-list endpoint. The authenticated completion response is therefore the discovery evidence. Current price must be captured from the account-visible price page at probe time. | TARGET |
 | `openai_compatible` | operator-selected | operator-selected credential-free HTTPS origin | authenticated `GET /models` | Extension lane only. It requires the same policy, evidence and owner gates and cannot inherit evidence from a built-in provider. | TARGET |
 
 Every provider must independently prove:
@@ -93,8 +98,10 @@ Every provider must independently prove:
   retention and training/model-improvement decision;
 - exact origin and model, provider-specific model confirmation, non-streaming
   completion, SSE streaming, typed tool call and local unknown-tool/field rejection;
-- bounded timeout/retry, token usage, reviewed price, per-probe cost cap and
-  seeded-secret redaction capture;
+- bounded timeout/retry, token usage, reviewed cache-hit/cache-miss/output
+  prices, account concurrency/RPM/TPM/TPD limits, balance-alert threshold,
+  pre-spend per-probe cost cap covering potentially billed retries, SSE media
+  type/event hash and seeded-secret redaction capture;
 - an immutable provider-policy snapshot and a manifest bound to provider ID,
   account, model, release digest and expiry.
 
@@ -103,7 +110,7 @@ information, private keys, raw database content and unredacted logs are always
 forbidden. Missing, stale or mismatched evidence keeps readiness at
 `llm_unverified` and makes production diagnosis fail closed with HTTP 503.
 
-Official references reviewed on 2026-07-10:
+Official references reviewed on 2026-07-11:
 
 - DeepSeek: [model list](https://api-docs.deepseek.com/api/list-models),
   [chat completion](https://api-docs.deepseek.com/api/create-chat-completion),

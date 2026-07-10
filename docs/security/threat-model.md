@@ -39,6 +39,7 @@ mutations.
 | Container escape/host takeover | non-root, cap-drop, no-new-privileges, read-only FS, no host/socket mounts | image scan/SBOM/signature pending |
 | AI prompt/tool injection | live model cannot execute host actions; mutation disabled; production diagnosis requires digest/release-bound provider evidence | R3/R4 typed domain-tool gates pending |
 | Secret leakage to provider | provider payload redacts configured secrets and common PII; seeded capture regression test; API key from secret file | live staging provider capture remains blocking |
+| Cross-provider evidence reuse | exclusive provider release flag plus evidence binding to provider ID, origin, model and release digest | each provider still needs its own live account and owner approvals |
 | Fake placeholder success | placeholder capabilities disabled with structured reason | blocking API/event test required |
 | DB/host loss | none sufficient at R0 | off-host encrypted restore is NO-GO |
 | Compromised management proxy | TLS secrets isolated to frontend; backend unexposed | signed release and external monitoring pending |

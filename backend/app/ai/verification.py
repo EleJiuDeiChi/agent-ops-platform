@@ -10,11 +10,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from urllib.parse import urlparse
 
 from app.config import Settings
 
 
 REQUIRED_CHECKS = (
+    "feature_flag",
     "model_discovery",
     "tool_call",
     "streaming",
@@ -22,6 +24,7 @@ REQUIRED_CHECKS = (
     "timeout_retry",
     "redaction_capture",
     "usage_cost",
+    "quota_pricing_snapshot",
     "policy_snapshot",
     "owner_approvals",
 )
@@ -52,6 +55,14 @@ def _parse_expiry(raw: Any) -> datetime | None:
     return value.astimezone(UTC)
 
 
+def _finite_decimal(raw: Any) -> Decimal | None:
+    try:
+        value = Decimal(str(raw))
+    except (InvalidOperation, ValueError):
+        return None
+    return value if value.is_finite() else None
+
+
 def _manifest_contract_complete(evidence: dict[str, Any]) -> bool:
     required_strings = (
         "provider_id",
@@ -61,6 +72,13 @@ def _manifest_contract_complete(evidence: dict[str, Any]) -> bool:
         "region",
     )
     if any(not isinstance(evidence.get(name), str) or not evidence[name].strip() for name in required_strings):
+        return False
+    feature_flag = evidence.get("feature_flag")
+    if not isinstance(feature_flag, dict):
+        return False
+    if feature_flag.get("enabled_provider_id") != evidence["provider_id"]:
+        return False
+    if feature_flag.get("exclusive") is not True:
         return False
     discovery = evidence.get("model_discovery")
     if not isinstance(discovery, dict):
@@ -76,14 +94,34 @@ def _manifest_contract_complete(evidence: dict[str, Any]) -> bool:
         return False
     if not DIGEST_PATTERN.fullmatch(str(discovery.get("response_sha256") or "")):
         return False
+    capabilities = evidence.get("provider_capabilities")
+    if not isinstance(capabilities, dict) or any(
+        capabilities.get(name) is not True
+        for name in ("streaming", "tool_calls", "usage_reporting")
+    ):
+        return False
 
     tool_call = evidence.get("tool_call")
     stream = evidence.get("stream")
     retry = evidence.get("timeout_retry")
     capture = evidence.get("redaction_capture")
     usage = evidence.get("usage_cost")
+    quota = evidence.get("quota")
+    quota_pricing = evidence.get("quota_pricing_evidence")
     policy = evidence.get("policy")
-    if not all(isinstance(item, dict) for item in (tool_call, stream, retry, capture, usage, policy)):
+    if not all(
+        isinstance(item, dict)
+        for item in (
+            tool_call,
+            stream,
+            retry,
+            capture,
+            usage,
+            quota,
+            quota_pricing,
+            policy,
+        )
+    ):
         return False
     if (
         tool_call.get("name") != "probe_echo"
@@ -91,7 +129,18 @@ def _manifest_contract_complete(evidence: dict[str, Any]) -> bool:
         or tool_call.get("schema_match") is not True
     ):
         return False
-    if stream.get("done_received") is not True or not isinstance(stream.get("json_chunks"), int) or stream["json_chunks"] <= 0:
+    if (
+        stream.get("done_received") is not True
+        or stream.get("contract_marker_received") is not True
+        or stream.get("usage_reported") is not True
+        or stream.get("content_type") != "text/event-stream"
+        or not DIGEST_PATTERN.fullmatch(
+            str(stream.get("normalized_events_sha256") or "")
+        )
+        or not isinstance(stream.get("json_chunks"), int)
+        or isinstance(stream["json_chunks"], bool)
+        or stream["json_chunks"] <= 0
+    ):
         return False
     if retry.get("connect_timeout_seconds", 0) <= 0 or retry.get("read_timeout_seconds", 0) <= 0:
         return False
@@ -113,18 +162,119 @@ def _manifest_contract_complete(evidence: dict[str, Any]) -> bool:
         return False
     if not DIGEST_PATTERN.fullmatch(str(capture.get("capture_sha256") or "")):
         return False
-    if not isinstance(usage.get("input_tokens"), int) or usage["input_tokens"] < 0:
+    if (
+        not isinstance(usage.get("input_tokens"), int)
+        or isinstance(usage["input_tokens"], bool)
+        or usage["input_tokens"] < 0
+    ):
         return False
-    if not isinstance(usage.get("output_tokens"), int) or usage["output_tokens"] < 0:
+    if (
+        not isinstance(usage.get("output_tokens"), int)
+        or isinstance(usage["output_tokens"], bool)
+        or usage["output_tokens"] < 0
+    ):
+        return False
+    for token_field in (
+        "cached_input_tokens",
+        "cache_miss_input_tokens",
+        "max_input_tokens_per_probe",
+        "input_payload_byte_upper_bound",
+        "tool_attempt_budget",
+    ):
+        value = usage.get(token_field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return False
+    if usage["max_input_tokens_per_probe"] <= 0:
+        return False
+    if (
+        usage["input_payload_byte_upper_bound"] <= 0
+        or usage["input_payload_byte_upper_bound"] > usage["max_input_tokens_per_probe"]
+        or usage["tool_attempt_budget"] != retry["max_retries"] + 1
+    ):
+        return False
+    if (
+        usage["cached_input_tokens"] + usage["cache_miss_input_tokens"]
+        != usage["input_tokens"]
+    ):
+        return False
+    if usage["input_tokens"] > usage["input_payload_byte_upper_bound"]:
         return False
     if not isinstance(usage.get("currency"), str) or not usage["currency"].strip():
         return False
-    try:
-        estimated_cost = Decimal(str(usage["estimated_cost"]))
-        approved_cap = Decimal(str(usage["approved_cap"]))
-    except (KeyError, InvalidOperation, ValueError):
+    estimated_cost = _finite_decimal(usage.get("estimated_cost"))
+    successful_response_cost = _finite_decimal(
+        usage.get("successful_responses_estimated_cost")
+    )
+    retry_cost_upper_bound = _finite_decimal(usage.get("retry_cost_upper_bound"))
+    approved_cap = _finite_decimal(usage.get("approved_cap"))
+    preflight_cost = _finite_decimal(usage.get("preflight_worst_case_cost"))
+    if any(
+        value is None
+        for value in (
+            estimated_cost,
+            successful_response_cost,
+            retry_cost_upper_bound,
+            approved_cap,
+            preflight_cost,
+        )
+    ):
         return False
-    if estimated_cost < 0 or approved_cap < 0 or estimated_cost > approved_cap:
+    if (
+        estimated_cost < 0
+        or successful_response_cost < 0
+        or retry_cost_upper_bound < 0
+        or approved_cap < 0
+        or preflight_cost < 0
+        or estimated_cost != successful_response_cost + retry_cost_upper_bound
+        or estimated_cost > approved_cap
+        or preflight_cost > approved_cap
+    ):
+        return False
+    rates = usage.get("rates_per_million_tokens")
+    if not isinstance(rates, dict):
+        return False
+    rate_values = [
+        _finite_decimal(rates.get(name))
+        for name in ("cache_hit_input", "cache_miss_input", "output")
+    ]
+    if any(value is None or value < 0 for value in rate_values):
+        return False
+    for name in (
+        "concurrency_limit",
+        "requests_per_minute",
+        "tokens_per_minute",
+        "tokens_per_day",
+    ):
+        value = quota.get(name)
+        if not (
+            (isinstance(value, int) and not isinstance(value, bool) and value > 0)
+            or (
+                isinstance(value, str)
+                and value in {"unlimited", "provider-managed", "account-tier"}
+            )
+        ):
+            return False
+    balance_alert_threshold = _finite_decimal(quota.get("balance_alert_threshold"))
+    if balance_alert_threshold is None or balance_alert_threshold < 0:
+        return False
+
+    for name in ("account_tier", "source_url"):
+        if not isinstance(quota_pricing.get(name), str) or not quota_pricing[name].strip():
+            return False
+    source_url = urlparse(str(quota_pricing["source_url"]))
+    if (
+        source_url.scheme != "https"
+        or not source_url.netloc
+        or source_url.username
+        or source_url.password
+        or source_url.query
+        or source_url.fragment
+    ):
+        return False
+    if not DIGEST_PATTERN.fullmatch(str(quota_pricing.get("snapshot_sha256") or "")):
+        return False
+    quota_pricing_reviewed_at = _parse_expiry(quota_pricing.get("reviewed_at"))
+    if quota_pricing_reviewed_at is None:
         return False
 
     if policy.get("training_opt_out_confirmed") is not True:
@@ -195,6 +345,9 @@ def validate_provider_evidence(
     expected_provider = (settings.llm_base_url or "").rstrip("/")
     if evidence.get("provider_id") != settings.llm_mode:
         return _unverified("llm_evidence_provider_id_mismatch")
+    feature_flag = evidence.get("feature_flag") or {}
+    if feature_flag.get("enabled_provider_id") not in settings.llm_enabled_providers:
+        return _unverified("llm_evidence_feature_flag_mismatch")
     if evidence.get("provider_origin") != expected_provider:
         return _unverified("llm_evidence_provider_mismatch")
     if evidence.get("model") != settings.llm_model:
@@ -204,6 +357,9 @@ def validate_provider_evidence(
 
     executed_at = _parse_expiry(evidence.get("executed_at"))
     expires_at = _parse_expiry(evidence.get("expires_at"))
+    quota_pricing_reviewed_at = _parse_expiry(
+        (evidence.get("quota_pricing_evidence") or {}).get("reviewed_at")
+    )
     now = (current_time or datetime.now(UTC)).astimezone(UTC)
     if (
         executed_at is None
@@ -212,6 +368,9 @@ def validate_provider_evidence(
         or expires_at <= now
         or expires_at <= executed_at
         or expires_at - executed_at > MAX_EVIDENCE_VALIDITY
+        or quota_pricing_reviewed_at is None
+        or quota_pricing_reviewed_at > executed_at + timedelta(minutes=5)
+        or executed_at - quota_pricing_reviewed_at > timedelta(days=30)
     ):
         return _unverified("llm_evidence_expired")
     checks = evidence.get("required_checks")

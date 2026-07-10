@@ -15,6 +15,7 @@ services:
       AIOPS_RELEASE_DIGEST: ${AIOPS_RELEASE_DIGEST:?set the immutable backend image/release digest}
       AIOPS_COMMIT_SHA: ${AIOPS_COMMIT_SHA:?set the reviewed release commit SHA}
       AIOPS_LLM_MODE: ${AIOPS_LLM_MODE:?set deepseek, moonshot, zhipu, or openai_compatible after provider review}
+      AIOPS_LLM_ENABLED_PROVIDERS: ${AIOPS_LLM_ENABLED_PROVIDERS:?set exactly the selected provider after its independent live gate}
       AIOPS_LLM_BASE_URL: ${AIOPS_LLM_BASE_URL:?set the probed HTTPS OpenAI-compatible base URL}
       AIOPS_LLM_MODEL: ${AIOPS_LLM_MODEL:?set the exact model proven by the provider-specific discovery contract}
       AIOPS_LLM_API_KEY_FILE: /run/secrets/llm_api_key

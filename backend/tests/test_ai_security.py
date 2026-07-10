@@ -145,3 +145,50 @@ def test_built_in_provider_payload_adapts_reasoning_fields(
     assert captured["url"] == f"{base_url}/chat/completions"
     assert captured["json"]["thinking"] == {"type": "enabled"}
     assert ("reasoning_effort" in captured["json"]) is expected_reasoning
+
+
+def test_provider_registry_declares_required_contract_capabilities() -> None:
+    from app.ai.provider_profiles import PROVIDER_PROFILES
+
+    expected_cache_formats = {
+        "deepseek": "deepseek_cache_fields",
+        "moonshot": "kimi_cached_tokens",
+        "zhipu": "prompt_tokens_details",
+    }
+    for provider_id in ("deepseek", "moonshot", "zhipu"):
+        profile = PROVIDER_PROFILES[provider_id]
+        assert profile.production_base_url
+        assert profile.candidate_model
+        assert profile.api_key_variable
+        assert profile.supports_streaming is True
+        assert profile.supports_tool_calls is True
+        assert profile.reports_usage is True
+        assert profile.cache_usage_format == expected_cache_formats[provider_id]
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "base_url"),
+    [
+        ("moonshot", "https://api.moonshot.ai/v1"),
+        ("zhipu", "https://open.bigmodel.cn/api/paas/v4"),
+    ],
+)
+def test_provider_rejects_unsupported_named_tool_choice(
+    monkeypatch,
+    provider_id: str,
+    base_url: str,
+) -> None:
+    monkeypatch.setenv("AIOPS_ENV", "test")
+    monkeypatch.setenv("AIOPS_LLM_MODE", provider_id)
+    monkeypatch.setenv("AIOPS_LLM_BASE_URL", base_url)
+    monkeypatch.setenv("AIOPS_LLM_MODEL", "provider-model")
+    monkeypatch.setenv("AIOPS_LLM_API_KEY", "provider-api-key-secret")
+
+    from app.ai.providers import LLMProviderError, OpenAICompatibleChatProvider
+
+    with pytest.raises(LLMProviderError, match="named tool choice"):
+        OpenAICompatibleChatProvider().chat_completion(
+            [{"role": "user", "content": "safe"}],
+            tools=[{"type": "function", "function": {"name": "probe"}}],
+            tool_choice={"type": "function", "function": {"name": "probe"}},
+        )
