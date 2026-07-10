@@ -4,11 +4,13 @@
 **
 
 !backend/
+backend/*
 !backend/app/
 !backend/app/**
 !backend/requirements.txt
 
 !frontend/
+frontend/*
 !frontend/src/
 !frontend/src/**
 !frontend/public/
@@ -20,5 +22,6 @@
 !frontend/vite.config.ts
 
 !deploy/
+deploy/*
 !deploy/nginx.conf
 !deploy/nginx.dev.conf

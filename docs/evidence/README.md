@@ -63,7 +63,7 @@ Observed locally on 2026-07-10:
 
 The remediation build produced local Linux/arm64 image IDs only:
 
-- backend: `sha256:862c90ff2b2057ba058e19dc01c4bff38c240210ea65e7fa4689d7d7d6f48c82`;
+- backend: `sha256:3cf648ad833da010257a51fd60b402f4c666c63de214f993d5ed8dcd5eb59bd8`;
 - frontend: `sha256:38bf291b7c5de3b074be7d3dcee02c50e030d4e6144555041ed1a07d64dd4ec1`.
 
 `scripts/test-production-compose.sh` passed setup enrollment, readiness,
@@ -72,7 +72,9 @@ the Compose/runtime JSON topology allowlists. With
 `PLAYWRIGHT_BROWSER_CHANNEL=chrome`, all three production-topology Playwright
 tests passed against the running TLS endpoint, including same-origin liveness,
 version, preflight, CSRF, real login and disabled-capability display. The Docker build contexts observed were
-approximately 419 KiB (backend) and 272 KiB (frontend).
+approximately 10 KiB (backend) and 272 KiB (frontend) under BuildKit. The
+legacy-builder compatibility rules were added after it exposed a 476 MB
+context regression on the development machine.
 
 These local image IDs are not registry digests and are not signed artifacts.
 This machine is outside the Ubuntu x86_64 production matrix. Local Compose
