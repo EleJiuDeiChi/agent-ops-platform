@@ -1,10 +1,13 @@
-FROM python:3.12.13-slim-bookworm
+FROM python:3.12.13-slim-trixie
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
 
-RUN groupadd --gid 10001 aiops \
+RUN apt-get update \
+    && apt-get upgrade --yes --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 aiops \
     && useradd --uid 10001 --gid 10001 --create-home --home-dir /home/aiops --shell /usr/sbin/nologin aiops
 
 WORKDIR /app
