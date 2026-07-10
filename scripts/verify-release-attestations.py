@@ -8,7 +8,7 @@ import base64
 import json
 import re
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 IMAGE_PATTERN = re.compile(r"^[^@\s]+@sha256:(?P<digest>[0-9a-f]{64})$")
@@ -26,22 +26,13 @@ PROVENANCE_TYPES = {
     "https://slsa.dev/provenance/v0.2",
 }
 SPDX_TYPE = "https://spdx.dev/Document"
+GITHUB_WORKFLOW_BUILD_TYPE = "https://actions.github.io/buildtypes/workflow/v1"
+GITHUB_HOSTED_BUILDER = "https://github.com/actions/runner/github-hosted"
 
 
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
-
-
-def iter_strings(value: Any) -> Iterable[str]:
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, dict):
-        for item in value.values():
-            yield from iter_strings(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from iter_strings(item)
 
 
 def decode_statement(row: Any) -> dict[str, Any]:
@@ -73,23 +64,30 @@ def load_statements(path: Path) -> list[dict[str, Any]]:
     return statements
 
 
-def has_subject(statement: dict[str, Any], digest: str) -> bool:
+def has_subject(statement: dict[str, Any], image_name: str, digest: str) -> bool:
     for subject in statement.get("subject") or []:
-        if isinstance(subject, dict) and (subject.get("digest") or {}).get("sha256") == digest:
+        if (
+            isinstance(subject, dict)
+            and subject.get("name") == image_name
+            and (subject.get("digest") or {}).get("sha256") == digest
+        ):
             return True
     return False
 
 
-def validate_common(statement: dict[str, Any], digest: str, predicate_type: str) -> None:
+def validate_common(
+    statement: dict[str, Any], image_name: str, digest: str, predicate_type: str
+) -> None:
     require(statement.get("_type") in IN_TOTO_STATEMENTS, "attestation has an unsupported in-toto statement version")
     require(statement.get("predicateType") == predicate_type, f"unexpected predicate type: {statement.get('predicateType')!r}")
-    require(has_subject(statement, digest), "attestation subject does not match the image digest")
+    require(has_subject(statement, image_name, digest), "attestation subject name/digest does not match the image")
     require(isinstance(statement.get("predicate"), dict), "attestation predicate must be an object")
 
 
 def validate_provenance(
     statements: list[dict[str, Any]],
     *,
+    image_name: str,
     digest: str,
     commit: str,
     repository: str,
@@ -100,18 +98,39 @@ def validate_provenance(
         if statement.get("predicateType") not in PROVENANCE_TYPES:
             continue
         try:
-            validate_common(statement, digest, str(statement["predicateType"]))
-            strings = list(iter_strings(statement["predicate"]))
-            lowered = [item.lower() for item in strings]
-            require(any(commit in item for item in strings), "provenance is not bound to the reviewed commit")
+            validate_common(statement, image_name, digest, str(statement["predicateType"]))
+            predicate = statement["predicate"]
+            build_definition = predicate.get("buildDefinition") or {}
             require(
-                any(repository.lower() in item for item in lowered),
+                build_definition.get("buildType") == GITHUB_WORKFLOW_BUILD_TYPE,
+                "provenance buildType is not the GitHub workflow v1 schema",
+            )
+            workflow = ((build_definition.get("externalParameters") or {}).get("workflow") or {})
+            require(isinstance(workflow, dict), "provenance workflow parameters are missing")
+            require(
+                workflow.get("repository") == f"https://github.com/{repository}",
                 "provenance is not bound to the release repository",
             )
-            require(any(ref in item for item in strings), "provenance is not bound to the semantic release ref")
+            require(workflow.get("ref") == ref, "provenance is not bound to the semantic release ref")
             require(
-                any("buildkit" in item or "github.com/actions/runner" in item for item in lowered),
-                "provenance builder is outside the allowed BuildKit/GitHub runner boundary",
+                workflow.get("path") == ".github/workflows/r0-ci.yml",
+                "provenance is not bound to the reviewed release workflow",
+            )
+            dependencies = build_definition.get("resolvedDependencies") or []
+            expected_prefix = f"git+https://github.com/{repository}"
+            require(
+                any(
+                    isinstance(item, dict)
+                    and str(item.get("uri") or "").startswith(expected_prefix)
+                    and (item.get("digest") or {}).get("gitCommit") == commit
+                    for item in dependencies
+                ),
+                "provenance resolvedDependencies are not bound to the reviewed Git commit",
+            )
+            builder = (predicate.get("runDetails") or {}).get("builder") or {}
+            require(
+                builder.get("id") == GITHUB_HOSTED_BUILDER,
+                "provenance builder is not the reviewed GitHub-hosted runner",
             )
             return
         except (KeyError, ValueError) as exc:
@@ -120,21 +139,26 @@ def validate_provenance(
     raise ValueError(f"no provenance statement satisfied release policy: {detail}")
 
 
-def validate_spdx(statements: list[dict[str, Any]], *, digest: str) -> None:
+def validate_spdx(statements: list[dict[str, Any]], *, image_name: str, digest: str) -> None:
     errors: list[str] = []
     for statement in statements:
         if statement.get("predicateType") != SPDX_TYPE:
             continue
         try:
-            validate_common(statement, digest, SPDX_TYPE)
+            validate_common(statement, image_name, digest, SPDX_TYPE)
             predicate = statement["predicate"]
             require(
                 bool(re.fullmatch(r"SPDX-2\.[0-9]+", str(predicate.get("spdxVersion") or ""))),
                 "SPDX predicate has an invalid spdxVersion",
             )
+            require(predicate.get("SPDXID") == "SPDXRef-DOCUMENT", "SPDX predicate is not a document")
+            require(bool(predicate.get("name")), "SPDX document name is missing")
+            require(predicate.get("dataLicense") == "CC0-1.0", "SPDX document data license drifted")
+            packages = predicate.get("packages")
+            require(isinstance(packages, list) and bool(packages), "SPDX predicate must describe packages")
             require(
-                isinstance(predicate.get("packages"), list) and bool(predicate["packages"]),
-                "SPDX predicate must describe at least one package",
+                all(isinstance(item, dict) and bool(item.get("SPDXID")) and bool(item.get("name")) for item in packages),
+                "SPDX predicate contains an empty package record",
             )
             return
         except ValueError as exc:
@@ -156,16 +180,18 @@ def validate(
     identity_match = IDENTITY_PATTERN.fullmatch(certificate_identity)
     require(bool(identity_match), "certificate identity must pin r0-ci.yml to an immutable semantic tag")
     digest = image_match.group("digest")
+    image_name = image_ref.rsplit("@", 1)[0]
     repository = identity_match.group("repository")
     ref = identity_match.group("ref")
     validate_provenance(
         load_statements(provenance_path),
+        image_name=image_name,
         digest=digest,
         commit=commit,
         repository=repository,
         ref=ref,
     )
-    validate_spdx(load_statements(sbom_path), digest=digest)
+    validate_spdx(load_statements(sbom_path), image_name=image_name, digest=digest)
 
 
 def self_test() -> None:
@@ -182,32 +208,85 @@ def self_test() -> None:
         "predicateType": "https://slsa.dev/provenance/v1",
         "predicate": {
             "buildDefinition": {
-                "buildType": "https://mobyproject.org/buildkit@v1",
+                "buildType": GITHUB_WORKFLOW_BUILD_TYPE,
                 "externalParameters": {
-                    "repository": f"https://github.com/{repository}",
-                    "ref": ref,
-                    "commit": commit,
+                    "workflow": {
+                        "repository": f"https://github.com/{repository}",
+                        "ref": ref,
+                        "path": ".github/workflows/r0-ci.yml",
+                    },
                 },
+                "resolvedDependencies": [
+                    {
+                        "uri": f"git+https://github.com/{repository}@{ref}",
+                        "digest": {"gitCommit": commit},
+                    }
+                ],
             },
-            "runDetails": {"builder": {"id": "https://github.com/actions/runner/github-hosted"}},
+            "runDetails": {"builder": {"id": GITHUB_HOSTED_BUILDER}},
         },
     }
     spdx = {
         **common,
         "predicateType": SPDX_TYPE,
-        "predicate": {"spdxVersion": "SPDX-2.3", "packages": [{"name": "application"}]},
+        "predicate": {
+            "spdxVersion": "SPDX-2.3",
+            "SPDXID": "SPDXRef-DOCUMENT",
+            "name": "ghcr.io/owner/image",
+            "dataLicense": "CC0-1.0",
+            "packages": [{"SPDXID": "SPDXRef-Package-app", "name": "application"}],
+        },
     }
     envelope = {"payload": base64.b64encode(json.dumps(provenance).encode()).decode()}
     require(decode_statement(envelope) == provenance, "DSSE payload decoding changed the statement")
-    validate_provenance([provenance], digest=digest, commit=commit, repository=repository, ref=ref)
-    validate_spdx([spdx], digest=digest)
-    invalid = json.loads(json.dumps(provenance))
-    invalid["predicate"]["buildDefinition"]["externalParameters"]["commit"] = "3" * 40
-    try:
-        validate_provenance([invalid], digest=digest, commit=commit, repository=repository, ref=ref)
-    except ValueError:
-        return
-    raise AssertionError("semantic verifier accepted provenance for the wrong commit")
+    validate_provenance(
+        [provenance],
+        image_name="ghcr.io/owner/image",
+        digest=digest,
+        commit=commit,
+        repository=repository,
+        ref=ref,
+    )
+    validate_spdx([spdx], image_name="ghcr.io/owner/image", digest=digest)
+
+    def expect_rejected(callback: Any, label: str) -> None:
+        try:
+            callback()
+        except ValueError:
+            return
+        raise AssertionError(f"semantic verifier accepted {label}")
+
+    padded = json.loads(json.dumps(provenance))
+    padded["subject"][0]["name"] = "ghcr.io/attacker/unrelated"
+    padded_build = padded["predicate"]["buildDefinition"]
+    padded_build["externalParameters"]["workflow"] = {
+        "repository": "https://github.com/attacker/repository",
+        "ref": "refs/tags/v9.9.9",
+        "path": ".github/workflows/evil.yml",
+    }
+    padded_build["resolvedDependencies"] = [
+        {"uri": "git+https://github.com/attacker/repository", "digest": {"gitCommit": "3" * 40}}
+    ]
+    padded["predicate"]["runDetails"]["builder"]["id"] = "https://attacker.invalid/builder"
+    padded["predicate"]["untrustedNote"] = f"{repository} {ref} {commit} buildkit"
+    expect_rejected(
+        lambda: validate_provenance(
+            [padded],
+            image_name="ghcr.io/owner/image",
+            digest=digest,
+            commit=commit,
+            repository=repository,
+            ref=ref,
+        ),
+        "provenance padded with correct values in an unrelated field",
+    )
+
+    empty_spdx = json.loads(json.dumps(spdx))
+    empty_spdx["predicate"]["packages"] = [{}]
+    expect_rejected(
+        lambda: validate_spdx([empty_spdx], image_name="ghcr.io/owner/image", digest=digest),
+        "SPDX document with an empty package",
+    )
 
 
 def main() -> int:

@@ -64,7 +64,19 @@ if [ "$SETUP" = "1" ]; then
 fi
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aiops-release-verify.XXXXXX")"
-trap 'rm -rf "$TMP_DIR"' EXIT
+STARTED=0
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if [ "$status" -ne 0 ] && [ "$STARTED" = "1" ]; then
+    echo "post-start verification failed; stopping the unverified deployment" >&2
+    "${COMPOSE[@]}" down --remove-orphans >/dev/null 2>&1 || \
+      echo "CRITICAL: failed to stop the unverified deployment" >&2
+  fi
+  rm -rf "$TMP_DIR"
+  exit "$status"
+}
+trap cleanup EXIT
 "${COMPOSE[@]}" config --format json > "$TMP_DIR/compose.json"
 
 python3 - "$TMP_DIR/compose.json" "$SETUP" > "$TMP_DIR/images.txt" <<'PY'
@@ -122,6 +134,10 @@ print(frontend)
 print(published.get("host_ip") or "")
 print(published.get("published") or "")
 print(commit)
+project_name = str(payload.get("name") or "")
+if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", project_name):
+    raise SystemExit("Compose project name is missing or invalid")
+print(project_name)
 PY
 
 BACKEND_IMAGE_REF="$(sed -n '1p' "$TMP_DIR/images.txt")"
@@ -129,6 +145,7 @@ FRONTEND_IMAGE_REF="$(sed -n '2p' "$TMP_DIR/images.txt")"
 HTTPS_BIND="$(sed -n '3p' "$TMP_DIR/images.txt")"
 HTTPS_PORT="$(sed -n '4p' "$TMP_DIR/images.txt")"
 COMMIT_SHA="$(sed -n '5p' "$TMP_DIR/images.txt")"
+PROJECT_NAME="$(sed -n '6p' "$TMP_DIR/images.txt")"
 
 topology_args=(compose "$TMP_DIR/compose.json" --https-bind "$HTTPS_BIND" --https-port "$HTTPS_PORT")
 if [ "$SETUP" = "1" ]; then
@@ -169,18 +186,29 @@ verify_image "$FRONTEND_IMAGE_REF" frontend
 echo "signed release verification passed for both immutable image digests"
 
 if [ "$ACTION" = "up" ]; then
-  "${COMPOSE[@]}" up -d --no-build
+  STARTED=1
+  "${COMPOSE[@]}" up -d --no-build --remove-orphans
   BACKEND_ID="$("${COMPOSE[@]}" ps -q backend)"
   FRONTEND_ID="$("${COMPOSE[@]}" ps -q frontend)"
   [ -n "$BACKEND_ID" ] && [ -n "$FRONTEND_ID" ] || {
     echo "production services did not create both expected containers" >&2
     exit 1
   }
-  docker inspect "$BACKEND_ID" "$FRONTEND_ID" > "$TMP_DIR/runtime-inspect.json"
+  mapfile -t PROJECT_CONTAINER_IDS < <(
+    docker ps -aq --filter "label=com.docker.compose.project=$PROJECT_NAME" | sort
+  )
+  mapfile -t EXPECTED_CONTAINER_IDS < <(printf '%s\n' "$BACKEND_ID" "$FRONTEND_ID" | sort)
+  [ "${#PROJECT_CONTAINER_IDS[@]}" -eq 2 ] && \
+    [ "${PROJECT_CONTAINER_IDS[*]}" = "${EXPECTED_CONTAINER_IDS[*]}" ] || {
+      echo "Compose project contains containers outside the backend/frontend allowlist" >&2
+      exit 1
+    }
+  docker inspect "${PROJECT_CONTAINER_IDS[@]}" > "$TMP_DIR/runtime-inspect.json"
   runtime_args=(runtime "$TMP_DIR/runtime-inspect.json" --https-bind "$HTTPS_BIND" --https-port "$HTTPS_PORT")
   if [ "$SETUP" = "1" ]; then
     runtime_args+=(--setup)
   fi
   "$ROOT_DIR/scripts/assert-production-topology.py" "${runtime_args[@]}"
+  STARTED=0
   echo "production Compose started from verified image digests"
 fi

@@ -94,6 +94,8 @@ grep -q 'cosign verify' "$ROOT_DIR/scripts/deploy-production.sh"
 grep -q 'verify-attestation' "$ROOT_DIR/scripts/deploy-production.sh"
 grep -q 'verify-release-attestations.py' "$ROOT_DIR/scripts/deploy-production.sh"
 grep -q 'assert-production-topology.py' "$ROOT_DIR/scripts/deploy-production.sh"
+grep -q 'up -d --no-build --remove-orphans' "$ROOT_DIR/scripts/deploy-production.sh"
+grep -q 'post-start verification failed; stopping the unverified deployment' "$ROOT_DIR/scripts/deploy-production.sh"
 if grep -Eq 'AIOPS_(SESSION_SECRET|LLM_API_KEY):' "$ROOT_DIR/deploy/compose.prod.yml"; then
   echo "production compose must use secret files, not direct secret values" >&2
   exit 1

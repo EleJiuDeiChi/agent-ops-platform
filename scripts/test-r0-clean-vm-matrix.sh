@@ -50,6 +50,16 @@ fail() {
   exit 1
 }
 
+retry_host_command() {
+  local attempt
+  for attempt in 1 2 3; do
+    "$@" && return 0
+    echo "host command failed on attempt $attempt/3; retrying" >&2
+    sleep "$((attempt * 2))"
+  done
+  return 1
+}
+
 require_host() {
   local command_name
   [ "$(uname -s)" = "Linux" ] || fail "this harness requires a Linux KVM host"
@@ -86,9 +96,19 @@ require_host() {
 }
 
 prepare_state() {
-  mkdir -p "$STATE_ROOT/cache" "$STATE_ROOT/runs" "$RUN_DIR" "$EVIDENCE_DIR"
+  mkdir -p "$STATE_ROOT/cache" "$STATE_ROOT/runs" "$EVIDENCE_DIR"
   exec 9>"$EVIDENCE_DIR/.matrix.lock"
   flock -n 9 || fail "another R0 clean-VM matrix is already running"
+  if sudo virsh list --all --name | grep -Eq '^agent-ops-r0-'; then
+    fail "stale agent-ops-r0 VM exists; preserve or clean the prior forensic run before retrying"
+  fi
+  if docker ps -a --format '{{.Names}}' | grep -Eq '^agent-ops-r0-registry-'; then
+    fail "stale agent-ops-r0 registry exists; clean the prior forensic run before retrying"
+  fi
+  if find "$STATE_ROOT/runs" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+    fail "stale agent-ops-r0 run directory exists; clean or archive it before retrying"
+  fi
+  mkdir -p "$RUN_DIR"
   : > "$KNOWN_HOSTS"
   chmod 0600 "$KNOWN_HOSTS"
   ssh-keygen -q -t ed25519 -N '' -f "$SSH_KEY"
@@ -164,9 +184,9 @@ prepare_source() {
 }
 
 build_diagnostic_images() {
-  docker build --pull --tag "$HOST_BACKEND_IMAGE" --file "$SOURCE_DIR/backend/Dockerfile" "$SOURCE_DIR"
-  docker build --pull --tag "$HOST_FRONTEND_IMAGE" --file "$SOURCE_DIR/frontend/Dockerfile" "$SOURCE_DIR"
-  docker build --pull --tag "$HOST_TEST_IMAGE" --file "$SOURCE_DIR/backend/Dockerfile.test" "$SOURCE_DIR"
+  retry_host_command docker build --pull --tag "$HOST_BACKEND_IMAGE" --file "$SOURCE_DIR/backend/Dockerfile" "$SOURCE_DIR"
+  retry_host_command docker build --pull --tag "$HOST_FRONTEND_IMAGE" --file "$SOURCE_DIR/frontend/Dockerfile" "$SOURCE_DIR"
+  retry_host_command docker build --pull --tag "$HOST_TEST_IMAGE" --file "$SOURCE_DIR/backend/Dockerfile.test" "$SOURCE_DIR"
 }
 
 cleanup_registry() {
@@ -206,7 +226,7 @@ push_release_images() {
   local backend_ref="$HOST_REGISTRY/agent-ops-backend:$REGISTRY_TAG"
   local frontend_ref="$HOST_REGISTRY/agent-ops-frontend:$REGISTRY_TAG"
   local backend_repo frontend_repo
-  docker pull "$REGISTRY_IMAGE" >/dev/null
+  retry_host_command docker pull "$REGISTRY_IMAGE" >/dev/null
   docker run --detach --rm \
     --name "$REGISTRY_NAME" \
     --publish "127.0.0.1:$REGISTRY_PORT:5000" \
@@ -666,16 +686,18 @@ sanitize_and_power_off_vm() {
         sleep 1
       done
       if [ "$state" != "shut off" ]; then
-        if ! sudo virsh destroy "$name" >/dev/null; then
-          while read -r mac; do
-            [ -n "$mac" ] || continue
-            sudo virsh domif-setlink "$name" "$mac" down --live >/dev/null 2>&1 || true
-            sudo virsh domif-setlink "$name" "$mac" down --config >/dev/null 2>&1 || true
-          done < <(sudo virsh domiflist "$name" | awk '$2 == "network" {print $5}')
-        fi
+        sudo virsh destroy "$name" >/dev/null 2>&1 || true
       fi
     fi
-    [ "$(sudo virsh domstate "$name" | tr -d '\r')" = "shut off" ] || return 1
+    state="$(sudo virsh domstate "$name" | tr -d '\r')"
+    if [ "$state" != "shut off" ]; then
+      while read -r mac; do
+        [ -n "$mac" ] || continue
+        sudo virsh domif-setlink "$name" "$mac" down --live >/dev/null 2>&1 || true
+        sudo virsh domif-setlink "$name" "$mac" down --config >/dev/null 2>&1 || true
+      done < <(sudo virsh domiflist "$name" | awk '$2 == "network" {print $5}')
+      return 1
+    fi
   fi
   [ "$restore_failed" = "0" ] || [ "$strict" = "0" ] || return 1
 }
@@ -694,10 +716,12 @@ patterns = (
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     re.compile(r"(?i)authorization:\s*bearer\s+[A-Za-z0-9._~+/=-]{8,}"),
     re.compile(r"AIOPS_(?:SESSION_SECRET|LLM_API_KEY|SETUP_TOKEN)=[^\s]+"),
-    re.compile(r'(?i)"(?:api[_-]?key|session[_-]?secret|setup[_-]?token)"\s*:\s*"(?!\*{3}|<redacted>)[^"\s]{8,}"'),
+    re.compile(r'(?i)"(?:(?:llm[_-]?)?api[_-]?key|session[_-]?secret|setup[_-]?token|password)"\s*:\s*"(?!\*{3}|<redacted>)[^"\s]{8,}"'),
 )
 for raw_path in sys.argv[1:]:
     path = Path(raw_path)
+    if not path.exists():
+        continue
     text = path.read_text(encoding="utf-8", errors="replace")
     for pattern in patterns:
         if pattern.search(text):
@@ -789,6 +813,9 @@ cleanup_on_exit() {
       echo "CRITICAL: ephemeral registry cleanup failed: $REGISTRY_NAME on port $REGISTRY_PORT" >&2
       docker container inspect "$REGISTRY_NAME" >&2 2>/dev/null || true
       ss -H -ltnp | awk -v suffix=":$REGISTRY_PORT" '$4 ~ suffix "$"' >&2 || true
+    fi
+    if ! scan_current_evidence_for_secrets; then
+      echo "CRITICAL: retained failure evidence may contain secret material; keep it mode 0600 and review before sharing" >&2
     fi
     echo "run log retained: $RUN_LOG" >&2
   fi
