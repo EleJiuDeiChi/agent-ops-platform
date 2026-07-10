@@ -17,6 +17,7 @@ COPY --from=build --chown=nginx:nginx /build/dist /usr/share/nginx/html
 
 RUN mkdir -p /tmp/client_temp /tmp/proxy_temp /tmp/fastcgi_temp \
         /tmp/uwsgi_temp /tmp/scgi_temp \
+    && chmod 0644 /etc/nginx/nginx.conf /etc/nginx/conf.d/default.conf \
     && chown -R nginx:nginx /tmp/client_temp /tmp/proxy_temp /tmp/fastcgi_temp \
         /tmp/uwsgi_temp /tmp/scgi_temp /usr/share/nginx/html /etc/nginx/conf.d
 

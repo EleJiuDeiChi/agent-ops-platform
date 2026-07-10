@@ -70,6 +70,7 @@ grep -q '^USER 10001:10001$' "$ROOT_DIR/backend/Dockerfile.test"
 grep -q '^USER 101:101$' "$ROOT_DIR/frontend/Dockerfile"
 grep -q 'npm ci' "$ROOT_DIR/frontend/Dockerfile"
 grep -q 'npm run build' "$ROOT_DIR/frontend/Dockerfile"
+grep -q 'chmod 0644 /etc/nginx/nginx.conf /etc/nginx/conf.d/default.conf' "$ROOT_DIR/frontend/Dockerfile"
 if grep -Eq 'npm run dev|vite preview' "$ROOT_DIR/frontend/Dockerfile"; then
   echo "frontend runtime must not use a development server" >&2
   exit 1

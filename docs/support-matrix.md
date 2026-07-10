@@ -22,8 +22,8 @@ Status vocabulary:
 | Init/firewall | systemd + UFW | Mutation remains disabled; no destructive-lab evidence. | TARGET |
 | Docker Engine | Candidate release lines 28.x and 29.x, exact patch captured per release test | The same OCI manifests passed on Engine 28.5.2/Ubuntu 22.04 and 29.6.1/Ubuntu 24.04. CI must repeat against the protected release digest before `SUPPORTED`. | EVIDENCE-ONLY |
 | Docker Compose | Compose plugin that supports the checked production schema, `config --format json`, health dependencies and secrets | Compose 5.3.1 passed on both clean VMs; older local Compose 2.31.0 also passed diagnostic topology. The release floor/ceiling is not a support promise until signed-release CI repeats it. | EVIDENCE-ONLY |
-| Platform frontend | Build input `node:22.23.1-bookworm-slim`; runtime input `nginx:1.28.3-alpine3.23` | Diagnostic OCI digest `sha256:2e3aa328d5a3fa654c13e7d3605137f671e302260c63c1d503bbde020c3da370` passed on both clean VMs. It is unsigned and cannot become a GA release. | EVIDENCE-ONLY |
-| Platform backend | Build input `python:3.12.13-slim-bookworm` | Diagnostic OCI digest `sha256:5b58dfed22d52cd5b53076434c0a968ec5ace1436d065e6f323a66545a543de2` passed on both clean VMs. The protected release must reproduce, scan and sign its own digest. | EVIDENCE-ONLY |
+| Platform frontend | Build input `node:22.23.1-bookworm-slim`; runtime input `nginx:1.28.3-alpine3.23` | The diagnostic OCI digest recorded in generated `matrix-summary.json` passed on both clean VMs. It is unsigned and cannot become a GA release. | EVIDENCE-ONLY |
+| Platform backend | Build input `python:3.12.13-slim-bookworm` | The diagnostic OCI digest recorded in generated `matrix-summary.json` passed on both clean VMs. The protected release must reproduce, scan and sign its own digest. | EVIDENCE-ONLY |
 | Managed Nginx | Ubuntu distribution Nginx | Read-only diagnostics only; exact apt version is captured by the future clean-VM/R4C manifest. | TARGET |
 | ACME | HTTP-01 only | No live ACME evidence. DNS-01 is outside first GA. | TARGET |
 
