@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aiops-r0-verify.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
+PYTHON_BIN="${AIOPS_PYTHON_BIN:-$ROOT_DIR/backend/.venv/bin/python}"
+test -x "$PYTHON_BIN" || PYTHON_BIN=python3
 
 required_files=(
   .dockerignore
@@ -34,9 +36,9 @@ for file in "${required_files[@]}"; do
   }
 done
 
-python3 -m py_compile "$ROOT_DIR/scripts/probe-llm-contract.py"
-python3 -m py_compile "$ROOT_DIR/scripts/assert-production-topology.py"
-"$ROOT_DIR/scripts/probe-llm-contract.py" --help >/dev/null
+"$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/probe-llm-contract.py"
+"$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/assert-production-topology.py"
+"$PYTHON_BIN" "$ROOT_DIR/scripts/probe-llm-contract.py" --help >/dev/null
 "$ROOT_DIR/scripts/deploy-production.sh" --help >/dev/null
 "$ROOT_DIR/scripts/assert-production-topology.py" --help >/dev/null
 
