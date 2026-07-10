@@ -31,6 +31,22 @@ paths configured in `.env.production`. Never paste their contents into the env
 file. Set `AIOPS_SETUP_TOKEN_EXPIRES_AT` to an ISO-8601 UTC timestamp no more
 than 60 minutes ahead; operational policy should use 15 minutes.
 
+Native Linux Compose preserves file-secret ownership. Before any supported
+start, set backend-readable secrets to UID/GID 10001 and frontend TLS files to
+UID/GID 101; all must be owner-read-only. The deployment wrapper rejects any
+other ownership or mode:
+
+```bash
+sudo chown 10001:10001 deploy/secrets/session_secret \
+  deploy/secrets/deepseek_api_key deploy/secrets/llm-contract.json \
+  deploy/secrets/setup_token
+sudo chmod 0400 deploy/secrets/session_secret \
+  deploy/secrets/deepseek_api_key deploy/secrets/llm-contract.json \
+  deploy/secrets/setup_token
+sudo chown 101:101 deploy/secrets/tls_cert.pem deploy/secrets/tls_key.pem
+sudo chmod 0400 deploy/secrets/tls_cert.pem deploy/secrets/tls_key.pem
+```
+
 Before using a live LLM, complete the probe manifest in
 `docs/support-matrix.md`. A successful HTTP request alone is insufficient.
 

@@ -69,6 +69,13 @@ export AIOPS_LLM_EVIDENCE_SHA256="sha256:$(openssl dgst -sha256 "$AIOPS_LLM_EVID
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=127.0.0.1' \
   -keyout "$AIOPS_TLS_KEY_FILE_HOST" -out "$AIOPS_TLS_CERT_FILE_HOST" >/dev/null 2>&1
 
+if [ "$(uname -s)" = "Linux" ]; then
+  docker run --rm --user 0:0 --entrypoint sh \
+    --volume "$TMP_DIR:/secrets" \
+    "$AIOPS_BACKEND_IMAGE_REF" \
+    -c 'chown 10001:10001 /secrets/session_secret /secrets/llm_api_key /secrets/llm_evidence.json /secrets/setup_token && chmod 0400 /secrets/session_secret /secrets/llm_api_key /secrets/llm_evidence.json /secrets/setup_token && chown 101:101 /secrets/tls_cert.pem /secrets/tls_key.pem && chmod 0400 /secrets/tls_cert.pem /secrets/tls_key.pem'
+fi
+
 "${COMPOSE_PROD[@]}" config --format json > "$TMP_DIR/compose-prod.json"
 "${COMPOSE_SETUP[@]}" config --format json > "$TMP_DIR/compose-setup.json"
 "$ROOT_DIR/scripts/assert-production-topology.py" compose \

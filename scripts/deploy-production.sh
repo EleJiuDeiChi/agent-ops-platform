@@ -63,9 +63,11 @@ TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aiops-release-verify.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
 "${COMPOSE[@]}" config --format json > "$TMP_DIR/compose.json"
 
-python3 - "$TMP_DIR/compose.json" > "$TMP_DIR/images.txt" <<'PY'
+python3 - "$TMP_DIR/compose.json" "$SETUP" > "$TMP_DIR/images.txt" <<'PY'
 import json
+import os
 import re
+import stat
 import sys
 
 payload = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -79,6 +81,31 @@ for name, image in (("backend", backend), ("frontend", frontend)):
 backend_env = (services.get("backend") or {}).get("environment") or {}
 if backend_env.get("AIOPS_RELEASE_DIGEST") != backend.rsplit("@", 1)[1]:
     raise SystemExit("AIOPS_RELEASE_DIGEST does not match the backend image reference")
+
+expected_secret_owners = {
+    "session_secret": 10001,
+    "llm_api_key": 10001,
+    "llm_evidence": 10001,
+    "tls_cert": 101,
+    "tls_key": 101,
+}
+if sys.argv[2] == "1":
+    expected_secret_owners["setup_token"] = 10001
+secrets = payload.get("secrets") or {}
+for name, expected_uid in expected_secret_owners.items():
+    source = str((secrets.get(name) or {}).get("file") or "")
+    if not source or os.path.islink(source):
+        raise SystemExit(f"{name} must reference a non-symlink secret file")
+    try:
+        metadata = os.stat(source)
+    except OSError as exc:
+        raise SystemExit(f"{name} secret file cannot be read: {exc}") from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit(f"{name} secret source must be a regular file")
+    if metadata.st_uid != expected_uid or stat.S_IMODE(metadata.st_mode) != 0o400:
+        raise SystemExit(
+            f"{name} must be owned by UID {expected_uid} with mode 0400"
+        )
 print(backend)
 print(frontend)
 PY
