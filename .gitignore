@@ -1,0 +1,61 @@
+# Operating-system and editor files
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local environment and secret material
+.env
+.env.*
+!.env.example
+!.env.production.example
+secrets/
+deploy/secrets/
+*.pem
+*.key
+*.crt
+
+# Runtime data and logs
+data/
+*.sqlite
+*.sqlite3
+*.db
+*.log
+logs/
+
+# Python
+backend/.venv/
+backend/__pycache__/
+backend/.pytest_cache/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node / frontend build output
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/test-results/
+frontend/playwright-report/
+test-results/
+playwright-report/
+npm-debug.log*
+
+# Local browser and Codex runtime artifacts
+.codex-artifacts/
+.playwright-cli/
+.playwright-mcp/
+.omx/evidence/
+.omx/logs/
+.omx/state/
+.omx/notepad.md
+.omx/project-memory.json
+.omx/ultragoal-archive/
+
+# Reference source checkouts are not product release contents. Keep the
+# project-owned research report under demo/ tracked.
+demo/1Panel/
+demo/BaoTa/

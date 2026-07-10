@@ -1,0 +1,1 @@
+执行 .omx/plans/prd-agent-ops-production-ga-20260710.md 与 .omx/plans/test-spec-agent-ops-production-ga-20260710.md 的生产 GA 方案。严格按 R0-R7 顺序推进，每个 story 只在对应 blocking gate、测试证据、本地验证、开发机同步与开发机验证通过后完成；真实 mutation 在审批、安全和破坏性实验门禁通过前保持 disabled。不得用 placeholder success、mock LLM 或文档声明替代生产证据。最终完成必须经过 ai-slop-cleaner、复验、独立 code-reviewer APPROVE 与 architect CLEAR。

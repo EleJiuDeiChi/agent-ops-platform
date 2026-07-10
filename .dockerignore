@@ -1,0 +1,24 @@
+# Default-deny the Docker build context. Only files required by the two images
+# are explicitly re-included so demo/, data/, secrets, node_modules, .venv and
+# developer caches can never be sent to a builder by accident.
+**
+
+!backend/
+!backend/app/
+!backend/app/**
+!backend/requirements.txt
+
+!frontend/
+!frontend/src/
+!frontend/src/**
+!frontend/public/
+!frontend/public/**
+!frontend/index.html
+!frontend/package.json
+!frontend/package-lock.json
+!frontend/tsconfig.json
+!frontend/vite.config.ts
+
+!deploy/
+!deploy/nginx.conf
+!deploy/nginx.dev.conf

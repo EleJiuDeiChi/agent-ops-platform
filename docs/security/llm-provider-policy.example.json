@@ -1,0 +1,26 @@
+{
+  "account_identifier": "REPLACE_WITH_NON_SECRET_ACCOUNT_ID",
+  "region": "PRC",
+  "retention": "REPLACE_WITH_REVIEWED_PROVIDER_POLICY",
+  "training_opt_out_confirmed": false,
+  "redacted_operational_data_only": true,
+  "ai_owner": "REPLACE_WITH_OWNER",
+  "security_owner": "REPLACE_WITH_OWNER",
+  "privacy_owner": "REPLACE_WITH_OWNER",
+  "provider_policy_url": "https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html",
+  "provider_policy_sha256": "sha256:REPLACE_WITH_64_HEX_CHARACTERS",
+  "reviewed_at": "REPLACE_WITH_UTC_ISO8601",
+  "owner_approvals": {
+    "ai": {"approved": false, "approved_at": "REPLACE_WITH_UTC_ISO8601"},
+    "security": {"approved": false, "approved_at": "REPLACE_WITH_UTC_ISO8601"},
+    "privacy": {"approved": false, "approved_at": "REPLACE_WITH_UTC_ISO8601"}
+  },
+  "connect_timeout_seconds": 10,
+  "read_timeout_seconds": 60,
+  "max_retries": 1,
+  "max_output_tokens": 128,
+  "input_cost_per_million_tokens": "REPLACE_WITH_REVIEWED_RATE",
+  "output_cost_per_million_tokens": "REPLACE_WITH_REVIEWED_RATE",
+  "cost_cap_per_probe": "REPLACE_WITH_APPROVED_CAP",
+  "currency": "CNY"
+}

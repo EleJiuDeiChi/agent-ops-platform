@@ -1,0 +1,13 @@
+# One-time first-install override. Remove this file from the compose command and
+# securely delete the setup token immediately after enrollment succeeds.
+services:
+  backend:
+    environment:
+      AIOPS_SETUP_TOKEN_FILE: /run/secrets/setup_token
+      AIOPS_SETUP_TOKEN_EXPIRES_AT: ${AIOPS_SETUP_TOKEN_EXPIRES_AT:?set a UTC expiry no more than 15 minutes ahead}
+    secrets:
+      - setup_token
+
+secrets:
+  setup_token:
+    file: ${AIOPS_SETUP_TOKEN_FILE_HOST:?set a host path to the one-time setup token}

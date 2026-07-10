@@ -1,0 +1,644 @@
+from __future__ import annotations
+
+import importlib
+import hashlib
+import json
+import os
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.config import ConfigurationError, load_settings
+from app.support import evaluate_support
+
+
+def production_environment(tmp_path: Path, now: datetime) -> dict[str, str]:
+    session_secret_file = tmp_path / "session_secret"
+    session_secret_file.write_text("s" * 48 + "\n", encoding="utf-8")
+    setup_token_file = tmp_path / "setup_token"
+    setup_token_file.write_text("t" * 48 + "\n", encoding="utf-8")
+    llm_key_file = tmp_path / "llm_api_key"
+    llm_key_file.write_text("k" * 48 + "\n", encoding="utf-8")
+    return {
+        "AIOPS_ENV": "prod",
+        "AIOPS_DB_PATH": str(tmp_path / "production.sqlite"),
+        "AIOPS_SESSION_SECRET_FILE": str(session_secret_file),
+        "AIOPS_TRUSTED_ORIGINS": "https://ops.example.test",
+        "AIOPS_COOKIE_SECURE": "1",
+        "AIOPS_TLS_ENABLED": "1",
+        "AIOPS_DEBUG_SKIP_PASSWORD_CHANGE": "0",
+        "AIOPS_SETUP_TOKEN_FILE": str(setup_token_file),
+        "AIOPS_SETUP_TOKEN_EXPIRES_AT": (now + timedelta(minutes=30)).isoformat(),
+        "AIOPS_LLM_MODE": "openai_compatible",
+        "AIOPS_LLM_BASE_URL": "https://llm.example.test/v1",
+        "AIOPS_LLM_MODEL": "frozen-production-model",
+        "AIOPS_LLM_API_KEY_FILE": str(llm_key_file),
+    }
+
+
+def apply_environment(monkeypatch: pytest.MonkeyPatch, values: dict[str, str]) -> None:
+    managed_names = {
+        "AIOPS_ENV",
+        "AIOPS_DB_PATH",
+        "AIOPS_RELEASE_DIGEST",
+        "AIOPS_COMMIT_SHA",
+        "AIOPS_SESSION_SECRET",
+        "AIOPS_SESSION_SECRET_FILE",
+        "AIOPS_TRUSTED_ORIGINS",
+        "AIOPS_COOKIE_SECURE",
+        "AIOPS_TLS_ENABLED",
+        "AIOPS_DEBUG_SKIP_PASSWORD_CHANGE",
+        "AIOPS_BOOTSTRAP_ADMIN_PASSWORD",
+        "AIOPS_BOOTSTRAP_ADMIN_PASSWORD_FILE",
+        "AIOPS_SETUP_TOKEN",
+        "AIOPS_SETUP_TOKEN_FILE",
+        "AIOPS_SETUP_TOKEN_EXPIRES_AT",
+        "AIOPS_LLM_MODE",
+        "AIOPS_LLM_BASE_URL",
+        "AIOPS_LLM_MODEL",
+        "AIOPS_LLM_API_KEY",
+        "AIOPS_LLM_API_KEY_FILE",
+        "AIOPS_LLM_EVIDENCE_FILE",
+        "AIOPS_LLM_EVIDENCE_SHA256",
+        "AIOPS_DEEPSEEK_API_KEY",
+        "AIOPS_DEEPSEEK_API_KEY_FILE",
+    }
+    for name in managed_names:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+
+@pytest.mark.parametrize(
+    ("remove", "override", "message"),
+    [
+        ("AIOPS_SESSION_SECRET_FILE", {}, "SESSION_SECRET"),
+        ("AIOPS_TRUSTED_ORIGINS", {}, "TRUSTED_ORIGINS"),
+        (None, {"AIOPS_TRUSTED_ORIGINS": "http://ops.example.test"}, "HTTPS origins"),
+        ("AIOPS_COOKIE_SECURE", {}, "COOKIE_SECURE"),
+        (None, {"AIOPS_COOKIE_SECURE": "0"}, "COOKIE_SECURE"),
+        ("AIOPS_TLS_ENABLED", {}, "TLS_ENABLED"),
+        (None, {"AIOPS_DEBUG_SKIP_PASSWORD_CHANGE": "1"}, "DEBUG_SKIP"),
+        ("AIOPS_LLM_MODE", {}, "LLM_MODE"),
+        ("AIOPS_LLM_BASE_URL", {}, "LLM_BASE_URL"),
+        (None, {"AIOPS_LLM_BASE_URL": "http://llm.example.test/v1"}, "must use HTTPS"),
+        (
+            None,
+            {"AIOPS_LLM_BASE_URL": "https://user:password@llm.example.test/v1"},
+            "must not contain userinfo",
+        ),
+        (
+            None,
+            {"AIOPS_LLM_BASE_URL": "https://llm.example.test/v1?tenant=secret"},
+            "must not contain params, query, or fragment",
+        ),
+        (
+            None,
+            {"AIOPS_LLM_BASE_URL": "https://llm.example.test/v1#fragment"},
+            "must not contain params, query, or fragment",
+        ),
+        ("AIOPS_LLM_MODEL", {}, "LLM_MODEL"),
+        ("AIOPS_LLM_API_KEY_FILE", {}, "LLM_API_KEY"),
+    ],
+)
+def test_production_configuration_fails_closed(
+    tmp_path: Path,
+    remove: str | None,
+    override: dict[str, str],
+    message: str,
+) -> None:
+    now = datetime.now(UTC)
+    env = production_environment(tmp_path, now)
+    if remove:
+        env.pop(remove)
+    env.update(override)
+    with pytest.raises(ConfigurationError, match=message):
+        load_settings(env, validate=True, current_time=now)
+
+
+def test_production_rejects_bootstrap_password_and_ambiguous_secret_sources(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    env = production_environment(tmp_path, now)
+    env["AIOPS_BOOTSTRAP_ADMIN_PASSWORD"] = "unsafe-bootstrap"
+    with pytest.raises(ConfigurationError, match="BOOTSTRAP_ADMIN_PASSWORD"):
+        load_settings(env, validate=True, current_time=now)
+
+    bootstrap_file = tmp_path / "bootstrap_password"
+    bootstrap_file.write_text("unsafe-bootstrap\n", encoding="utf-8")
+    env = production_environment(tmp_path, now)
+    env["AIOPS_BOOTSTRAP_ADMIN_PASSWORD_FILE"] = str(bootstrap_file)
+    with pytest.raises(ConfigurationError, match="BOOTSTRAP_ADMIN_PASSWORD"):
+        load_settings(env, validate=True, current_time=now)
+
+    env = production_environment(tmp_path, now)
+    env["AIOPS_SESSION_SECRET"] = "x" * 48
+    with pytest.raises(ConfigurationError, match="only one"):
+        load_settings(env, validate=True, current_time=now)
+
+
+def test_setup_enrollment_configuration_and_expiry_are_fail_closed(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    env = production_environment(tmp_path, now)
+    env.pop("AIOPS_SETUP_TOKEN_FILE")
+    env.pop("AIOPS_SETUP_TOKEN_EXPIRES_AT")
+    settings = load_settings(env, validate=True, current_time=now)
+    with pytest.raises(ConfigurationError, match="requires short-lived setup enrollment"):
+        settings.validate_initialization(initialized=False)
+
+    env = production_environment(tmp_path, now)
+    settings = load_settings(env, validate=True, current_time=now)
+    with pytest.raises(ConfigurationError, match="remove setup token"):
+        settings.validate_initialization(initialized=True)
+
+    env = production_environment(tmp_path, now)
+    env["AIOPS_SETUP_TOKEN_EXPIRES_AT"] = (now - timedelta(seconds=1)).isoformat()
+    with pytest.raises(ConfigurationError, match="expired"):
+        load_settings(env, validate=True, current_time=now)
+
+
+def test_production_lifespan_rejects_uninitialized_instance_without_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    env = production_environment(tmp_path, now)
+    env.pop("AIOPS_SETUP_TOKEN_FILE")
+    env.pop("AIOPS_SETUP_TOKEN_EXPIRES_AT")
+    apply_environment(monkeypatch, env)
+    import app.main as main
+
+    importlib.reload(main)
+    with pytest.raises(ConfigurationError, match="requires short-lived setup enrollment"):
+        with TestClient(main.app, base_url="https://ops.example.test"):
+            pass
+
+
+def test_setup_enrollment_secure_cookies_and_public_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    env = production_environment(tmp_path, now)
+    apply_environment(monkeypatch, env)
+    import app.main as main
+
+    importlib.reload(main)
+    session_secret = (tmp_path / "session_secret").read_text(encoding="utf-8").strip()
+    setup_token = (tmp_path / "setup_token").read_text(encoding="utf-8").strip()
+    with TestClient(main.app, base_url="https://ops.example.test") as client:
+        live = client.get("/health/live")
+        assert live.status_code == 200
+        assert live.json() == {
+            "status": "alive",
+            "service": "aiops-control-plane",
+            "version": "0.1.0",
+        }
+        assert live.headers["cache-control"] == "no-store"
+
+        version = client.get("/version")
+        assert version.status_code == 200
+        assert version.headers["cache-control"] == "no-store"
+        assert version.json() == {
+            "service": "aiops-control-plane",
+            "version": "0.1.0",
+            "environment": "prod",
+            "release_digest": None,
+            "commit_sha": None,
+            "provenance": {
+                "status": "unverified",
+                "reason_code": "release_digest_unconfigured",
+            },
+        }
+
+        preflight = client.get("/preflight")
+        assert preflight.status_code == 200
+        assert preflight.json()["status"] in {"supported", "unsupported_for_mutation"}
+
+        ready = client.get("/health/ready")
+        assert ready.status_code == 503
+        assert ready.json()["reasons"] == ["setup_required", "llm_unverified"]
+        assert ready.json()["dependencies"]["worker"]["status"] == "disabled_by_release_gate"
+        assert ready.json()["dependencies"]["agent"]["status"] == "disabled_by_release_gate"
+        assert ready.json()["dependencies"]["llm"] == {
+            "status": "unverified",
+            "reason_code": "llm_unverified",
+            "verification_reason_code": "release_digest_unconfigured",
+        }
+
+        csrf_response = client.get("/api/csrf")
+        token = csrf_response.json()["csrf_token"]
+        assert "Secure" in csrf_response.headers["set-cookie"]
+        invalid = client.post(
+            "/api/setup/enroll",
+            json={"token": "wrong", "username": "admin", "password": "ProductionPassword123!"},
+            headers={"X-CSRF-Token": token, "Origin": "https://ops.example.test"},
+        )
+        assert invalid.status_code == 403
+
+        enrolled = client.post(
+            "/api/setup/enroll",
+            json={
+                "token": setup_token,
+                "username": "admin",
+                "password": "ProductionPassword123!",
+            },
+            headers={"X-CSRF-Token": token, "Origin": "https://ops.example.test"},
+        )
+        assert enrolled.status_code == 200, enrolled.text
+        assert enrolled.json() == {"status": "initialized"}
+        assert client.post(
+            "/api/setup/enroll",
+            json={
+                "token": setup_token,
+                "username": "admin",
+                "password": "ProductionPassword123!",
+            },
+            headers={"X-CSRF-Token": token, "Origin": "https://ops.example.test"},
+        ).status_code == 409
+
+        ready = client.get("/health/ready")
+        assert ready.status_code == 503
+        assert ready.json()["status"] == "not_ready"
+        assert ready.json()["reasons"] == ["llm_unverified"]
+        assert ready.json()["dependencies"]["setup"]["status"] == "complete"
+
+        csrf_response = client.get("/api/csrf")
+        login_token = csrf_response.json()["csrf_token"]
+        logged_in = client.post(
+            "/api/login",
+            json={"username": "admin", "password": "ProductionPassword123!"},
+            headers={"X-CSRF-Token": login_token, "Origin": "https://ops.example.test"},
+        )
+        assert logged_in.status_code == 200, logged_in.text
+        cookie = logged_in.headers["set-cookie"]
+        assert "Secure" in cookie
+        assert "HttpOnly" in cookie
+        assert "SameSite=strict" in cookie
+
+        diagnosis = client.post(
+            "/api/diagnosis/sessions",
+            json={"question": "production diagnosis must remain gated"},
+            headers={"X-CSRF-Token": login_token, "Origin": "https://ops.example.test"},
+        )
+        assert diagnosis.status_code == 503
+        assert diagnosis.json()["detail"] == {
+            "reason_code": "llm_unverified",
+            "verification_reason_code": "release_digest_unconfigured",
+        }
+
+        simulated = client.post(
+            "/api/tasks",
+            json={"title": "must not fake success", "simulate": True},
+            headers={"X-CSRF-Token": login_token, "Origin": "https://ops.example.test"},
+        )
+        assert simulated.status_code == 409
+        assert simulated.json()["detail"]["reason_code"] == "simulation_disabled_in_production"
+
+        secret = client.post(
+            "/api/secrets",
+            json={"name": "fake", "value": "must-never-persist"},
+            headers={"X-CSRF-Token": login_token, "Origin": "https://ops.example.test"},
+        )
+        assert secret.status_code == 501
+        assert secret.json()["detail"]["reason_code"] == "secret_store_not_implemented"
+
+        firewall = client.post(
+            "/api/security/firewall/preflight",
+            json={"port": 443, "protocol": "tcp"},
+            headers={"X-CSRF-Token": login_token, "Origin": "https://ops.example.test"},
+        )
+        assert firewall.status_code == 200
+        assert firewall.json()["rollback_plan"] == {
+            "available": False,
+            "automatic": False,
+            "strategy": None,
+            "reason_code": "not_implemented",
+        }
+        assert firewall.json()["safe_to_request_approval"] is False
+
+        audit = client.get("/api/audit")
+        assert audit.status_code == 200
+        assert [row["event_type"] for row in audit.json()].count(
+            "setup_enrollment_completed"
+        ) == 1
+        assert "secret_created" not in [row["event_type"] for row in audit.json()]
+
+        combined = " ".join(
+            [live.text, version.text, preflight.text, ready.text, enrolled.text, logged_in.text]
+        )
+        assert session_secret not in combined
+        assert setup_token not in combined
+        assert str(tmp_path) not in combined
+
+
+def test_support_preflight_matrix() -> None:
+    supported = evaluate_support(
+        system="Linux",
+        machine="x86_64",
+        os_release={"ID": "ubuntu", "VERSION_ID": "24.04"},
+    )
+    assert supported["status"] == "supported"
+    assert supported["mutation_supported"] is True
+
+    darwin = evaluate_support(system="Darwin", machine="arm64", os_release={})
+    assert darwin["status"] == "unsupported_for_mutation"
+    assert darwin["mutation_supported"] is False
+    assert "unsupported_operating_system" in darwin["reason_codes"]
+
+    unsupported_ubuntu = evaluate_support(
+        system="Linux",
+        machine="aarch64",
+        os_release={"ID": "ubuntu", "VERSION_ID": "20.04"},
+    )
+    assert unsupported_ubuntu["status"] == "unsupported_for_mutation"
+    assert set(unsupported_ubuntu["reason_codes"]) >= {
+        "unsupported_ubuntu_version",
+        "unsupported_architecture",
+    }
+
+
+def test_provider_uses_canonical_key_file_and_explicit_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    env = production_environment(tmp_path, now)
+    apply_environment(monkeypatch, env)
+
+    from app.ai.providers import DeepSeekChatProvider, deepseek_enabled, model_name
+
+    provider = DeepSeekChatProvider()
+    assert provider.api_key == "k" * 48
+    assert provider.base_url == "https://llm.example.test/v1"
+    assert provider.model == "frozen-production-model"
+    assert deepseek_enabled() is True
+    assert model_name() == "frozen-production-model"
+
+
+def test_test_environment_keeps_mock_provider_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    apply_environment(
+        monkeypatch,
+        {"AIOPS_ENV": "test", "AIOPS_DB_PATH": str(tmp_path / "test.sqlite")},
+    )
+
+    from app.ai.providers import deepseek_enabled, llm_mode, model_name
+
+    assert llm_mode() == "mock"
+    assert model_name() == "mock"
+    assert deepseek_enabled() is False
+
+
+def test_version_reports_declared_release_identity_without_authentication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "sha256:" + "a" * 64
+    commit_sha = "b" * 40
+    apply_environment(
+        monkeypatch,
+        {
+            "AIOPS_ENV": "test",
+            "AIOPS_DB_PATH": str(tmp_path / "version.sqlite"),
+            "AIOPS_RELEASE_DIGEST": digest,
+            "AIOPS_COMMIT_SHA": commit_sha,
+        },
+    )
+    import app.main as main
+
+    importlib.reload(main)
+    with TestClient(main.app) as client:
+        response = client.get("/version")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {
+        "service": "aiops-control-plane",
+        "version": "0.1.0",
+        "environment": "test",
+        "release_digest": digest,
+        "commit_sha": commit_sha,
+        "provenance": {"status": "declared", "reason_code": None},
+    }
+
+
+def provider_evidence_environment(
+    tmp_path: Path,
+    now: datetime,
+    *,
+    overrides: dict | None = None,
+    writable: bool = False,
+) -> tuple[dict[str, str], dict]:
+    from app.ai.verification import REQUIRED_CHECKS
+
+    env = production_environment(tmp_path, now)
+    release_digest = "sha256:" + "a" * 64
+    evidence = {
+        "schema_version": 1,
+        "result": "pass",
+        "executed_at": now.isoformat(),
+        "provider_origin": env["AIOPS_LLM_BASE_URL"],
+        "model": env["AIOPS_LLM_MODEL"],
+        "release_digest": release_digest,
+        "expires_at": (now + timedelta(hours=1)).isoformat(),
+        "runner_identity": "test-runner",
+        "evidence_path": "test-evidence/llm-evidence.json",
+        "account_identifier": "test-account",
+        "region": "PRC",
+        "models_response_sha256": "sha256:" + "c" * 64,
+        "tool_call": {
+            "name": "probe_echo",
+            "arguments": {"value": "r0-live-contract-probe"},
+            "schema_match": True,
+        },
+        "invalid_tool_rejection": {
+            "unknown_tool_rejected": True,
+            "extra_field_rejected": True,
+        },
+        "stream": {"json_chunks": 1, "done_received": True},
+        "timeout_retry": {
+            "connect_timeout_seconds": 10,
+            "read_timeout_seconds": 60,
+            "max_retries": 1,
+            "attempts": {"models": 1, "tool_call": 1, "streaming": 1},
+        },
+        "redaction_capture": {
+            "seeded_secret_absent": True,
+            "replacement_marker_present": True,
+            "capture_sha256": "sha256:" + "e" * 64,
+        },
+        "usage_cost": {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "estimated_cost": "0.0001",
+            "approved_cap": "0.01",
+            "currency": "CNY",
+        },
+        "policy": {
+            "training_opt_out_confirmed": True,
+            "redacted_operational_data_only": True,
+            "provider_policy_sha256": "sha256:" + "d" * 64,
+            "ai_owner": "ai-owner",
+            "security_owner": "security-owner",
+            "privacy_owner": "privacy-owner",
+            "owner_approvals": {
+                role: {"approved": True, "approved_at": now.isoformat()}
+                for role in ("ai", "security", "privacy")
+            },
+        },
+        "required_checks": {name: True for name in REQUIRED_CHECKS},
+    }
+    if overrides:
+        evidence.update(overrides)
+    evidence_file = tmp_path / "llm-evidence.json"
+    raw = json.dumps(evidence, sort_keys=True).encode()
+    evidence_file.write_bytes(raw)
+    evidence_file.chmod(0o600 if writable else 0o400)
+    env.update(
+        {
+            "AIOPS_RELEASE_DIGEST": release_digest,
+            "AIOPS_LLM_EVIDENCE_FILE": str(evidence_file),
+            "AIOPS_LLM_EVIDENCE_SHA256": "sha256:" + hashlib.sha256(raw).hexdigest(),
+        }
+    )
+    return env, evidence
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason_code"),
+    [
+        ({"provider_origin": "https://different.example.test/v1"}, "llm_evidence_provider_mismatch"),
+        ({"model": "different-model"}, "llm_evidence_model_mismatch"),
+        ({"release_digest": "sha256:" + "b" * 64}, "llm_evidence_release_mismatch"),
+        ({"expires_at": "2000-01-01T00:00:00+00:00"}, "llm_evidence_expired"),
+        ({"runner_identity": ""}, "llm_evidence_contract_incomplete"),
+        (
+            {"tool_call": {"name": "probe_echo", "schema_match": True}},
+            "llm_evidence_contract_incomplete",
+        ),
+        ({"required_checks": {}}, "llm_evidence_checks_incomplete"),
+    ],
+)
+def test_provider_evidence_must_match_deployment(
+    tmp_path: Path,
+    overrides: dict,
+    reason_code: str,
+) -> None:
+    from app.ai.verification import validate_provider_evidence
+
+    now = datetime.now(UTC)
+    env, _ = provider_evidence_environment(tmp_path, now, overrides=overrides)
+    settings = load_settings(env, validate=True, current_time=now)
+    result = validate_provider_evidence(settings, current_time=now)
+    assert result.verified is False
+    assert result.reason_code == reason_code
+
+
+def test_provider_evidence_requires_protected_file_and_matching_digest(tmp_path: Path) -> None:
+    from app.ai.verification import validate_provider_evidence
+
+    now = datetime.now(UTC)
+    env, _ = provider_evidence_environment(tmp_path, now, writable=True)
+    settings = load_settings(env, validate=True, current_time=now)
+    assert validate_provider_evidence(settings, current_time=now).reason_code == (
+        "llm_evidence_unprotected"
+    )
+
+    evidence_file = Path(env["AIOPS_LLM_EVIDENCE_FILE"])
+    evidence_file.chmod(0o400)
+    env["AIOPS_LLM_EVIDENCE_SHA256"] = "sha256:" + "f" * 64
+    settings = load_settings(env, validate=True, current_time=now)
+    assert validate_provider_evidence(settings, current_time=now).reason_code == (
+        "llm_evidence_digest_mismatch"
+    )
+
+
+def test_verified_provider_evidence_unlocks_readiness_and_diagnosis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.storage import db
+
+    now = datetime.now(UTC)
+    env, _ = provider_evidence_environment(tmp_path, now)
+    db.configure(Path(env["AIOPS_DB_PATH"]), tmp_path / "bootstrap.txt")
+    db.init_db(create_bootstrap_admin=False)
+    assert db.complete_initial_setup("admin", "ProductionPassword123!") is True
+    env.pop("AIOPS_SETUP_TOKEN_FILE")
+    env.pop("AIOPS_SETUP_TOKEN_EXPIRES_AT")
+    apply_environment(monkeypatch, env)
+    import app.main as main
+
+    importlib.reload(main)
+    monkeypatch.setattr(
+        main,
+        "run_deepseek_diagnosis",
+        lambda actor_id, session_id, question: {
+            "status": "verified-provider-used",
+            "question": question,
+        },
+    )
+    with TestClient(main.app, base_url="https://ops.example.test") as client:
+        ready = client.get("/health/ready")
+        assert ready.status_code == 200
+        assert ready.json()["dependencies"]["llm"] == {
+            "status": "verified",
+            "reason_code": None,
+            "verification_reason_code": None,
+        }
+        token = client.get("/api/csrf").json()["csrf_token"]
+        login = client.post(
+            "/api/login",
+            json={"username": "admin", "password": "ProductionPassword123!"},
+            headers={"X-CSRF-Token": token, "Origin": "https://ops.example.test"},
+        )
+        assert login.status_code == 200
+        token = client.get("/api/csrf").json()["csrf_token"]
+        diagnosis = client.post(
+            "/api/diagnosis/sessions",
+            json={"question": "safe question"},
+            headers={"X-CSRF-Token": token, "Origin": "https://ops.example.test"},
+        )
+        assert diagnosis.status_code == 200
+        assert diagnosis.json()["status"] == "verified-provider-used"
+
+
+@pytest.mark.parametrize("failure_stage", ["after_admin", "after_marker", "after_audit"])
+def test_initial_setup_transaction_rolls_back_every_stage(
+    tmp_path: Path,
+    failure_stage: str,
+) -> None:
+    from app.storage import db
+
+    db.configure(tmp_path / "atomic.sqlite", tmp_path / "bootstrap.txt")
+    db.init_db(create_bootstrap_admin=False)
+
+    def fail(stage: str) -> None:
+        if stage == failure_stage:
+            raise RuntimeError("injected setup failure")
+
+    with pytest.raises(RuntimeError, match="injected setup failure"):
+        db.complete_initial_setup("admin", "ProductionPassword123!", failure_hook=fail)
+
+    assert db.has_users() is False
+    assert db.setup_consumed() is False
+    assert db.list_audit() == []
+
+
+def test_initial_setup_commits_admin_marker_and_audit_once(tmp_path: Path) -> None:
+    from app.storage import db
+
+    db.configure(tmp_path / "atomic-success.sqlite", tmp_path / "bootstrap.txt")
+    db.init_db(create_bootstrap_admin=False)
+    assert db.complete_initial_setup("admin", "ProductionPassword123!") is True
+    assert db.has_users() is True
+    assert db.setup_consumed() is True
+    assert [row["event_type"] for row in db.list_audit()] == ["setup_enrollment_completed"]
+    assert db.complete_initial_setup("other", "AnotherPassword123!") is False
+    assert [row["event_type"] for row in db.list_audit()] == ["setup_enrollment_completed"]

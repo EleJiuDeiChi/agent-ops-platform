@@ -1,0 +1,382 @@
+name: R0 production baseline
+
+on:
+  push:
+    branches: [main, "release/**"]
+    tags: ["v*.*.*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r0-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Test, audit, build and supply-chain evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python 3.12.13
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: 3.12.13
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Set up Node 22.23.1
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22.23.1
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install backend test and audit tools
+        run: python -m pip install --disable-pip-version-check -r backend/requirements-dev.txt
+
+      - name: Run backend tests
+        env:
+          PYTHONPATH: backend
+        run: pytest -q backend/tests
+
+      - name: Audit backend runtime dependencies
+        run: pip-audit -r backend/requirements.txt
+
+      - name: Install locked frontend dependencies
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: Run frontend unit tests
+        working-directory: frontend
+        run: npm run test:unit
+
+      - name: Run frontend typecheck and production build
+        working-directory: frontend
+        run: npm run build
+
+      - name: List Playwright tests
+        working-directory: frontend
+        run: npm run test:e2e:list
+
+      - name: Install Playwright Chromium for production-topology E2E
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Audit frontend dependencies
+        working-directory: frontend
+        run: npm audit --audit-level=high
+
+      - name: Validate R0 files and Compose JSON topology
+        run: ./scripts/verify-production-baseline.sh
+
+      - name: Build backend production image
+        run: docker build --pull --tag agent-ops-backend:r0-ci --file backend/Dockerfile .
+
+      - name: Build frontend production image
+        run: docker build --pull --tag agent-ops-frontend:r0-ci --file frontend/Dockerfile .
+
+      - name: Run production Compose runtime gates
+        env:
+          AIOPS_IMAGE_TAG: r0-ci
+          AIOPS_TEST_HTTPS_PORT: "55443"
+          AIOPS_RUN_PRODUCTION_PLAYWRIGHT: "1"
+        run: ./scripts/test-production-compose.sh
+
+      - name: Install Syft 1.46.0
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          syft-version: v1.46.0
+
+      - name: Install Trivy 0.72.0
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.72.0
+          cache: true
+
+      - name: Generate image metadata and SPDX SBOM evidence
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/r0/sbom evidence/r0/scan evidence/r0/metadata
+          docker version > evidence/r0/metadata/docker-version.txt
+          docker compose version > evidence/r0/metadata/compose-version.txt
+          docker image inspect agent-ops-backend:r0-ci > evidence/r0/metadata/backend-image-inspect.json
+          docker image inspect agent-ops-frontend:r0-ci > evidence/r0/metadata/frontend-image-inspect.json
+          syft version > evidence/r0/metadata/syft-version.txt
+          trivy version > evidence/r0/metadata/trivy-version.txt
+          syft agent-ops-backend:r0-ci -o spdx-json=evidence/r0/sbom/backend.spdx.json
+          syft agent-ops-frontend:r0-ci -o spdx-json=evidence/r0/sbom/frontend.spdx.json
+
+      - name: Scan images and retain machine-readable evidence
+        run: |
+          set -euo pipefail
+          scan_status=0
+          trivy image --scanners vuln --severity HIGH,CRITICAL \
+            --exit-code 1 --format json --output evidence/r0/scan/backend.trivy.json \
+            agent-ops-backend:r0-ci || scan_status=1
+          trivy image --scanners vuln --severity HIGH,CRITICAL \
+            --exit-code 1 --format json --output evidence/r0/scan/frontend.trivy.json \
+            agent-ops-frontend:r0-ci || scan_status=1
+          exit "$scan_status"
+
+      - name: Upload PR and branch SBOM/scan evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: r0-supply-chain-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/r0/
+          if-no-files-found: error
+          retention-days: 30
+
+  e2e:
+    name: Chromium E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node 22.23.1
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22.23.1
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install locked frontend dependencies
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: Install Playwright Chromium and system dependencies
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Chromium critical-path E2E
+        working-directory: frontend
+        env:
+          CI: "1"
+          PLAYWRIGHT_E2E_PORT: "55173"
+        run: npm run test:e2e
+
+      - name: Upload Playwright failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-r0-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            frontend/test-results/
+            frontend/playwright-report/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  release:
+    name: Protected keyless release signing and provenance
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [verify, e2e]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment:
+      name: production-release
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Validate immutable semantic release tag
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release tag must match vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Resolve lowercase GHCR image names
+        id: images
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "backend=ghcr.io/${owner}/agent-ops-backend" >> "$GITHUB_OUTPUT"
+          echo "frontend=ghcr.io/${owner}/agent-ops-frontend" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build and push backend with OCI SBOM/provenance
+        id: backend
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: true
+          tags: ${{ steps.images.outputs.backend }}:${{ github.ref_name }}
+          sbom: true
+          provenance: mode=max
+
+      - name: Build and push frontend with OCI SBOM/provenance
+        id: frontend
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: frontend/Dockerfile
+          push: true
+          tags: ${{ steps.images.outputs.frontend }}:${{ github.ref_name }}
+          sbom: true
+          provenance: mode=max
+
+      - name: Set up Node 22.23.1 for shipped-artifact E2E
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22.23.1
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install locked frontend and Playwright Chromium
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      - name: Install Trivy 0.72.0 for shipped-artifact scan
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.72.0
+          cache: true
+
+      - name: Pull and test the exact pushed image digests
+        env:
+          AIOPS_BACKEND_IMAGE_REF: ${{ steps.images.outputs.backend }}@${{ steps.backend.outputs.digest }}
+          AIOPS_FRONTEND_IMAGE_REF: ${{ steps.images.outputs.frontend }}@${{ steps.frontend.outputs.digest }}
+          AIOPS_COMMIT_SHA: ${{ github.sha }}
+          AIOPS_TEST_HTTPS_PORT: "55443"
+          AIOPS_RUN_PRODUCTION_PLAYWRIGHT: "1"
+        run: |
+          set -euo pipefail
+          docker pull "$AIOPS_BACKEND_IMAGE_REF"
+          docker pull "$AIOPS_FRONTEND_IMAGE_REF"
+          mkdir -p evidence/release
+          trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 1 \
+            --format json --output evidence/release/backend.trivy.json \
+            "$AIOPS_BACKEND_IMAGE_REF"
+          trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 1 \
+            --format json --output evidence/release/frontend.trivy.json \
+            "$AIOPS_FRONTEND_IMAGE_REF"
+          ./scripts/test-production-compose.sh
+
+      - name: Create GitHub build provenance for backend
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ${{ steps.images.outputs.backend }}
+          subject-digest: ${{ steps.backend.outputs.digest }}
+          push-to-registry: true
+
+      - name: Create GitHub build provenance for frontend
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ${{ steps.images.outputs.frontend }}
+          subject-digest: ${{ steps.frontend.outputs.digest }}
+          push-to-registry: true
+
+      - name: Install Cosign 3.1.1
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.1
+
+      - name: Install Syft 1.46.0 for signed release SBOM
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          syft-version: v1.46.0
+
+      - name: Generate and sign SPDX SBOM attestations for exact digests
+        env:
+          BACKEND_IMAGE: ${{ steps.images.outputs.backend }}
+          BACKEND_DIGEST: ${{ steps.backend.outputs.digest }}
+          FRONTEND_IMAGE: ${{ steps.images.outputs.frontend }}
+          FRONTEND_DIGEST: ${{ steps.frontend.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/release
+          syft "$BACKEND_IMAGE@$BACKEND_DIGEST" -o spdx-json=evidence/release/backend.spdx.json
+          syft "$FRONTEND_IMAGE@$FRONTEND_DIGEST" -o spdx-json=evidence/release/frontend.spdx.json
+          cosign attest --yes --type spdxjson --predicate evidence/release/backend.spdx.json \
+            "$BACKEND_IMAGE@$BACKEND_DIGEST"
+          cosign attest --yes --type spdxjson --predicate evidence/release/frontend.spdx.json \
+            "$FRONTEND_IMAGE@$FRONTEND_DIGEST"
+
+      - name: Keyless-sign immutable image digests
+        env:
+          BACKEND_IMAGE: ${{ steps.images.outputs.backend }}
+          BACKEND_DIGEST: ${{ steps.backend.outputs.digest }}
+          FRONTEND_IMAGE: ${{ steps.images.outputs.frontend }}
+          FRONTEND_DIGEST: ${{ steps.frontend.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "$BACKEND_IMAGE@$BACKEND_DIGEST"
+          cosign sign --yes "$FRONTEND_IMAGE@$FRONTEND_DIGEST"
+
+      - name: Verify keyless signatures and save release evidence
+        env:
+          BACKEND_IMAGE: ${{ steps.images.outputs.backend }}
+          BACKEND_DIGEST: ${{ steps.backend.outputs.digest }}
+          FRONTEND_IMAGE: ${{ steps.images.outputs.frontend }}
+          FRONTEND_DIGEST: ${{ steps.frontend.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/release
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/r0-ci.yml@${GITHUB_REF}"
+          issuer="https://token.actions.githubusercontent.com"
+          cosign version > evidence/release/cosign-version.txt
+          cosign verify --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
+            --output json "$BACKEND_IMAGE@$BACKEND_DIGEST" > evidence/release/backend-cosign-verify.json
+          cosign verify --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
+            --output json "$FRONTEND_IMAGE@$FRONTEND_DIGEST" > evidence/release/frontend-cosign-verify.json
+          cosign verify-attestation --type spdxjson \
+            --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
+            "$BACKEND_IMAGE@$BACKEND_DIGEST" > evidence/release/backend-sbom-verify.json
+          cosign verify-attestation --type spdxjson \
+            --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
+            "$FRONTEND_IMAGE@$FRONTEND_DIGEST" > evidence/release/frontend-sbom-verify.json
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          payload = {
+              "release_tag": os.environ["GITHUB_REF_NAME"],
+              "commit_sha": os.environ["GITHUB_SHA"],
+              "workflow_ref": os.environ["GITHUB_WORKFLOW_REF"],
+              "backend": {"image": os.environ["BACKEND_IMAGE"], "digest": os.environ["BACKEND_DIGEST"]},
+              "frontend": {"image": os.environ["FRONTEND_IMAGE"], "digest": os.environ["FRONTEND_DIGEST"]},
+          }
+          Path("evidence/release/manifest.json").write_text(
+              json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Upload protected release evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signed-release-${{ github.ref_name }}-${{ github.run_id }}
+          path: evidence/release/
+          if-no-files-found: error
+          retention-days: 90

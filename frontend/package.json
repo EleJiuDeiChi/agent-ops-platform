@@ -1,0 +1,40 @@
+{
+  "name": "aiops-panel-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "npm run typecheck && vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run test:unit",
+    "test:unit": "vitest run",
+    "test:unit:watch": "vitest",
+    "test:e2e:install": "playwright install chromium",
+    "test:e2e": "playwright test",
+    "test:e2e:list": "playwright test --list",
+    "preview": "vite preview --host 127.0.0.1"
+  },
+  "dependencies": {
+    "@ant-design/icons": "^6.3.2",
+    "@ant-design/x": "^2.8.0",
+    "@ant-design/x-markdown": "^2.8.0",
+    "@ant-design/x-sdk": "^2.8.0",
+    "@vitejs/plugin-react": "^4.7.0",
+    "antd": "^6.5.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "typescript": "^5.8.3",
+    "vite": "^7.0.6"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1",
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.2",
+    "@testing-library/user-event": "14.6.1",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "jsdom": "29.1.1",
+    "vitest": "4.1.10"
+  }
+}
