@@ -1,21 +1,21 @@
 {
   "version": 1,
   "createdAt": "2026-07-10T06:35:58.699Z",
-  "updatedAt": "2026-07-10T16:18:05.635Z",
+  "updatedAt": "2026-07-10T18:38:02.610Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
   "codexGoalMode": "aggregate",
   "goals": [
     {
-      "id": "G001-r0-production-baseline",
-      "title": "R0 Production Baseline",
-      "objective": "实施生产范围冻结、Ubuntu/依赖/浏览器/LLM 支持矩阵、生产配置 fail-closed、setup enrollment、健康探针、测试与发布基线。以 PRD Step 0 和 Test Spec R0/GA-R0-001/002 为唯一验收依据；当前 mutation 保持 disabled。",
-      "status": "in_progress",
-      "attempt": 2,
-      "createdAt": "2026-07-10T06:35:58.699Z",
-      "updatedAt": "2026-07-10T14:30:16.000Z",
-      "startedAt": "2026-07-10T14:30:16.000Z"
+      "id": "G009-r0-multi-provider-llm-contract",
+      "title": "R0 Multi-provider LLM Contract",
+      "objective": "在进入 R1 前完成 provider-neutral OpenAI-compatible 适配层与生产支持矩阵，首批覆盖 DeepSeek、月之暗面 Moonshot/Kimi、智谱 GLM；每个提供商独立声明 base URL、模型发现、stream/tool-call/usage 契约、密钥文件、数据区域/留存/训练使用、价格配额、live probe 证据和 feature flag。业务层不得硬编码单一提供商，未完成独立 live gate 的 provider 必须 fail-closed。",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-10T16:18:05.635Z",
+      "updatedAt": "2026-07-10T16:18:05.635Z",
+      "evidence": "User explicitly requires support for 月之暗面、智谱等模型 in addition to DeepSeek on 2026-07-10."
     },
     {
       "id": "G002-r1-agent-boundary",
@@ -83,14 +83,14 @@
       "updatedAt": "2026-07-10T06:35:58.699Z"
     },
     {
-      "id": "G009-r0-multi-provider-llm-contract",
-      "title": "R0 Multi-provider LLM Contract",
-      "objective": "在进入 R1 前完成 provider-neutral OpenAI-compatible 适配层与生产支持矩阵，首批覆盖 DeepSeek、月之暗面 Moonshot/Kimi、智谱 GLM；每个提供商独立声明 base URL、模型发现、stream/tool-call/usage 契约、密钥文件、数据区域/留存/训练使用、价格配额、live probe 证据和 feature flag。业务层不得硬编码单一提供商，未完成独立 live gate 的 provider 必须 fail-closed。",
-      "status": "pending",
-      "attempt": 0,
-      "createdAt": "2026-07-10T16:18:05.635Z",
-      "updatedAt": "2026-07-10T16:18:05.635Z",
-      "evidence": "User explicitly requires support for 月之暗面、智谱等模型 in addition to DeepSeek on 2026-07-10."
+      "id": "G001-r0-production-baseline",
+      "title": "R0 Production Baseline",
+      "objective": "实施生产范围冻结、Ubuntu/依赖/浏览器/LLM 支持矩阵、生产配置 fail-closed、setup enrollment、健康探针、测试与发布基线。以 PRD Step 0 和 Test Spec R0/GA-R0-001/002 为唯一验收依据；当前 mutation 保持 disabled。",
+      "status": "in_progress",
+      "attempt": 2,
+      "createdAt": "2026-07-10T06:35:58.699Z",
+      "updatedAt": "2026-07-10T14:30:16.000Z",
+      "startedAt": "2026-07-10T14:30:16.000Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",
