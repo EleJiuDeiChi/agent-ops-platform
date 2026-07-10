@@ -23,7 +23,7 @@ rsync -az --delete \
   --exclude 'deploy/secrets/' \
   --exclude 'backend/.venv/' \
   --exclude 'backend/.pytest_cache/' \
-  --exclude 'data/*.sqlite' \
+  --exclude 'data/' \
   --exclude 'frontend/node_modules/' \
   --exclude 'frontend/dist/' \
   --exclude 'frontend/.vite/' \
