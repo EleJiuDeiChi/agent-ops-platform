@@ -27,9 +27,13 @@ changing the SHA.
 
 Only an immutable `vMAJOR.MINOR.PATCH` tag can enter the `release` job. The job
 also targets the GitHub `production-release` environment. Repository owners
-must configure that environment with required reviewers and prevent
-self-review; until then, signing is `NO-GO` even though the workflow is
-executable.
+should configure that environment with required reviewers and prevent
+self-review when the account plan supports those rules. User-owned private
+repositories on GitHub Free cannot enable required reviewers or the
+GitHub-hosted Attestations API, so this repository instead restricts the
+environment to immutable semantic-version tags and records that account-level
+limitation as a release governance risk rather than weakening cryptographic
+verification.
 
 The release job:
 
@@ -37,7 +41,9 @@ The release job:
 2. pulls those exact digests, scans them with Trivy, and runs the production
    TLS/setup/Playwright topology against the same immutable references;
 3. asks BuildKit for OCI SBOM and `mode=max` provenance;
-4. creates GitHub build-provenance attestations for each digest;
+4. creates a SLSA v1 provenance predicate bound to the repository, workflow,
+   semantic tag and commit, then publishes it as a Cosign keyless OIDC
+   attestation for each digest;
 5. uses Cosign 3.1.1 keyless OIDC signing on each immutable digest;
 6. verifies the workflow certificate identity and uploads the verification
    JSON plus tag/commit/workflow/digest manifest.

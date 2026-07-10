@@ -190,7 +190,6 @@ jobs:
       contents: read
       packages: write
       id-token: write
-      attestations: write
 
     steps:
       - name: Validate immutable semantic release tag
@@ -283,24 +282,71 @@ jobs:
             "$AIOPS_FRONTEND_IMAGE_REF"
           ./scripts/test-production-compose.sh
 
-      - name: Create GitHub build provenance for backend
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-name: ${{ steps.images.outputs.backend }}
-          subject-digest: ${{ steps.backend.outputs.digest }}
-          push-to-registry: true
-
-      - name: Create GitHub build provenance for frontend
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-name: ${{ steps.images.outputs.frontend }}
-          subject-digest: ${{ steps.frontend.outputs.digest }}
-          push-to-registry: true
-
       - name: Install Cosign 3.1.1
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: v3.1.1
+
+      - name: Generate and keyless-sign SLSA provenance for exact digests
+        env:
+          BACKEND_IMAGE: ${{ steps.images.outputs.backend }}
+          BACKEND_DIGEST: ${{ steps.backend.outputs.digest }}
+          FRONTEND_IMAGE: ${{ steps.images.outputs.frontend }}
+          FRONTEND_DIGEST: ${{ steps.frontend.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/release
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          ref = os.environ["GITHUB_REF"]
+          payload = {
+              "buildDefinition": {
+                  "buildType": "https://actions.github.io/buildtypes/workflow/v1",
+                  "externalParameters": {
+                      "workflow": {
+                          "repository": f"https://github.com/{repository}",
+                          "ref": ref,
+                          "path": ".github/workflows/r0-ci.yml",
+                      }
+                  },
+                  "internalParameters": {
+                      "github": {
+                          "eventName": os.environ["GITHUB_EVENT_NAME"],
+                          "runId": os.environ["GITHUB_RUN_ID"],
+                          "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"],
+                      }
+                  },
+                  "resolvedDependencies": [
+                      {
+                          "uri": f"git+https://github.com/{repository}@{ref}",
+                          "digest": {"gitCommit": os.environ["GITHUB_SHA"]},
+                      }
+                  ],
+              },
+              "runDetails": {
+                  "builder": {"id": "https://github.com/actions/runner/github-hosted"},
+                  "metadata": {
+                      "invocationId": (
+                          f"https://github.com/{repository}/actions/runs/"
+                          f"{os.environ['GITHUB_RUN_ID']}/attempts/{os.environ['GITHUB_RUN_ATTEMPT']}"
+                      )
+                  },
+              },
+          }
+          Path("evidence/release/slsa-provenance.json").write_text(
+              json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
+          cosign attest --yes --type slsaprovenance1 \
+            --predicate evidence/release/slsa-provenance.json \
+            "$BACKEND_IMAGE@$BACKEND_DIGEST"
+          cosign attest --yes --type slsaprovenance1 \
+            --predicate evidence/release/slsa-provenance.json \
+            "$FRONTEND_IMAGE@$FRONTEND_DIGEST"
 
       - name: Install Syft 1.46.0 for signed release SBOM
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
@@ -350,10 +396,10 @@ jobs:
             --output json "$BACKEND_IMAGE@$BACKEND_DIGEST" > evidence/release/backend-cosign-verify.json
           cosign verify --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
             --output json "$FRONTEND_IMAGE@$FRONTEND_DIGEST" > evidence/release/frontend-cosign-verify.json
-          cosign verify-attestation --type slsaprovenance \
+          cosign verify-attestation --type slsaprovenance1 \
             --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
             "$BACKEND_IMAGE@$BACKEND_DIGEST" > evidence/release/backend-provenance-verify.json
-          cosign verify-attestation --type slsaprovenance \
+          cosign verify-attestation --type slsaprovenance1 \
             --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
             "$FRONTEND_IMAGE@$FRONTEND_DIGEST" > evidence/release/frontend-provenance-verify.json
           cosign verify-attestation --type spdxjson \

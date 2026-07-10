@@ -163,7 +163,7 @@ verify_image() {
     --certificate-oidc-issuer "$OIDC_ISSUER" \
     "$image_ref" > /dev/null
   cosign verify-attestation \
-    --type slsaprovenance \
+    --type slsaprovenance1 \
     --certificate-identity "$CERTIFICATE_IDENTITY" \
     --certificate-oidc-issuer "$OIDC_ISSUER" \
     "$image_ref" > "$provenance"
