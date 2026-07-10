@@ -9,12 +9,14 @@ KEEP_VMS="${AIOPS_R0_KEEP_VMS:-0}"
 VM_MEMORY_MIB="${AIOPS_R0_VM_MEMORY_MIB:-4096}"
 VM_VCPUS="${AIOPS_R0_VM_VCPUS:-2}"
 VM_DISK_SIZE="${AIOPS_R0_VM_DISK_SIZE:-40G}"
+VM_DATA_DISK_SIZE="${AIOPS_R0_VM_DATA_DISK_SIZE:-20G}"
 RUN_ID="${AIOPS_R0_RUN_ID:-$(date -u +%Y%m%d%H%M%S)-$$}"
 RUN_DIR="$STATE_ROOT/runs/$RUN_ID"
 EVIDENCE_DIR="$ROOT_DIR/.omx/evidence/production-ga/GA-R0-001"
 SSH_KEY="$RUN_DIR/id_ed25519"
 KNOWN_HOSTS="$RUN_DIR/known_hosts"
 RUN_LOG="$EVIDENCE_DIR/matrix-$RUN_ID.log"
+RUN_LOG_OWNERSHIP_MARKER="$RUN_DIR/run-log-owned"
 REGISTRY_NAME="agent-ops-r0-registry-$RUN_ID"
 REGISTRY_PORT="${AIOPS_R0_REGISTRY_PORT:-$((55000 + ($$ % 1000)))}"
 REGISTRY_IMAGE="${AIOPS_R0_REGISTRY_IMAGE:-registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373}"
@@ -39,10 +41,23 @@ REGISTRY_TAG=""
 CURRENT_VM_NAME=""
 CURRENT_VM_IP=""
 REGISTRY_STARTED=0
+REGISTRY_OWNED=0
+LOG_TEE_PID=""
+LOG_TEE_FINALIZED=0
+LOG_TEE_ACTIVE=0
+RUN_INITIALIZED=0
+RUN_DIR_OWNED=0
+RUN_LOG_OWNED=0
+MATRIX_OWNS_STATUS=0
+SUMMARY_GENERATOR_SHA256=""
+STAGED_SUMMARY_SHA256=""
+STAGED_STATUS_SHA256=""
 
 MATRIX=(
-  "ubuntu2204|jammy|ubuntu22.04|22.04|28.5.2|5:28.5.2-1~ubuntu.22.04~jammy|2.2.5-1~ubuntu.22.04~jammy|0.35.0-1~ubuntu.22.04~jammy|5.3.1-1~ubuntu.22.04~jammy|5.3.1"
-  "ubuntu2404|noble|ubuntu24.04|24.04|29.6.1|5:29.6.1-1~ubuntu.24.04~noble|2.2.5-1~ubuntu.24.04~noble|0.35.0-1~ubuntu.24.04~noble|5.3.1-1~ubuntu.24.04~noble|5.3.1"
+  "ubuntu2204-ext4|jammy|ubuntu22.04|22.04|28.5.2|5:28.5.2-1~ubuntu.22.04~jammy|2.2.5-1~ubuntu.22.04~jammy|0.35.0-1~ubuntu.22.04~jammy|5.3.1-1~ubuntu.22.04~jammy|5.3.1|ext4"
+  "ubuntu2204-xfs|jammy|ubuntu22.04|22.04|28.5.2|5:28.5.2-1~ubuntu.22.04~jammy|2.2.5-1~ubuntu.22.04~jammy|0.35.0-1~ubuntu.22.04~jammy|5.3.1-1~ubuntu.22.04~jammy|5.3.1|xfs"
+  "ubuntu2404-ext4|noble|ubuntu24.04|24.04|29.6.1|5:29.6.1-1~ubuntu.24.04~noble|2.2.5-1~ubuntu.24.04~noble|0.35.0-1~ubuntu.24.04~noble|5.3.1-1~ubuntu.24.04~noble|5.3.1|ext4"
+  "ubuntu2404-xfs|noble|ubuntu24.04|24.04|29.6.1|5:29.6.1-1~ubuntu.24.04~noble|2.2.5-1~ubuntu.24.04~noble|0.35.0-1~ubuntu.24.04~noble|5.3.1-1~ubuntu.24.04~noble|5.3.1|xfs"
 )
 
 fail() {
@@ -65,7 +80,7 @@ require_host() {
   [ "$(uname -s)" = "Linux" ] || fail "this harness requires a Linux KVM host"
   [ -e /dev/kvm ] || fail "/dev/kvm is unavailable"
   sudo -n true 2>/dev/null || fail "passwordless sudo is required on the lab host"
-  for command_name in curl docker flock gpg gpgv python3 qemu-img rsync scp sha256sum ssh ss tar virt-install; do
+  for command_name in curl docker flock gpg gpgv mkfifo python3 qemu-img rsync scp sha256sum ssh ssh-keygen ss tar tee virt-install; do
     command -v "$command_name" >/dev/null || fail "$command_name is required"
   done
   if ! command -v cloud-localds >/dev/null || [ ! -f "$CLOUD_KEYRING" ]; then
@@ -76,6 +91,7 @@ require_host() {
   [[ "$RUN_ID" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,39}$ ]] || fail "AIOPS_R0_RUN_ID has an invalid format"
   [[ "$REGISTRY_PORT" =~ ^[0-9]+$ ]] || fail "AIOPS_R0_REGISTRY_PORT must be numeric"
   [ "$REGISTRY_PORT" -ge 1024 ] && [ "$REGISTRY_PORT" -le 65535 ] || fail "registry port is out of range"
+  [ "$KEEP_VMS" = "0" ] || [ "$KEEP_VMS" = "1" ] || fail "AIOPS_R0_KEEP_VMS must be 0 or 1"
   [[ "$REGISTRY_IMAGE" =~ ^[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || fail "registry image must be pinned by sha256 digest"
   sudo virsh net-info default >/dev/null 2>&1 || fail "libvirt default network is missing"
   if [ "$(sudo virsh net-info default | awk '/Active:/ {print $2}')" != "yes" ]; then
@@ -113,14 +129,68 @@ prepare_state() {
       -print -quit | grep -q .; then
     fail "stale agent-ops-r0 VM disk exists without an active run; inspect and clean it before retrying"
   fi
+  RUN_DIR_OWNED=1
   mkdir -p "$RUN_DIR"
   : > "$KNOWN_HOSTS"
   chmod 0600 "$KNOWN_HOSTS"
   ssh-keygen -q -t ed25519 -N '' -f "$SSH_KEY"
   sudo install -d -m 0755 "$IMAGE_ROOT"
-  : > "$RUN_LOG"
-  chmod 0600 "$RUN_LOG"
-  exec > >(tee -a "$RUN_LOG") 2>&1
+  python3 - "$RUN_LOG" "$RUN_LOG_OWNERSHIP_MARKER" <<'PY' || \
+    fail "run log path already exists or could not be created safely for this run ID"
+import os
+import sys
+
+path, marker = sys.argv[1:]
+no_follow = getattr(os, "O_NOFOLLOW", 0)
+if no_follow == 0:
+    raise SystemExit("O_NOFOLLOW is unavailable")
+descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow, 0o600)
+try:
+    stat = os.fstat(descriptor)
+    os.fsync(descriptor)
+    marker_descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow, 0o600)
+    try:
+        os.write(marker_descriptor, f"{stat.st_dev}:{stat.st_ino}\n".encode())
+        os.fsync(marker_descriptor)
+    finally:
+        os.close(marker_descriptor)
+except BaseException:
+    os.close(descriptor)
+    os.unlink(path)
+    raise
+else:
+    os.close(descriptor)
+PY
+  RUN_LOG_OWNED=1
+  exec 3>&1 4>&2
+  mkfifo "$RUN_DIR/run-log.pipe"
+  tee -a "$RUN_LOG" < "$RUN_DIR/run-log.pipe" >&3 &
+  LOG_TEE_PID="$!"
+  if ! exec > "$RUN_DIR/run-log.pipe" 2>&1; then
+    kill "$LOG_TEE_PID" >/dev/null 2>&1 || true
+    wait "$LOG_TEE_PID" >/dev/null 2>&1 || true
+    return 1
+  fi
+  LOG_TEE_ACTIVE=1
+  RUN_INITIALIZED=1
+}
+
+finalize_run_log() {
+  [ "$LOG_TEE_FINALIZED" = "0" ] || return 0
+  LOG_TEE_FINALIZED=1
+  if [ -z "$LOG_TEE_PID" ]; then
+    return 0
+  fi
+  if [ "$LOG_TEE_ACTIVE" = "1" ]; then
+    exec 1>&3 2>&4
+    LOG_TEE_ACTIVE=0
+  else
+    kill "$LOG_TEE_PID" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$LOG_TEE_PID" ]; then
+    wait "$LOG_TEE_PID" || return 1
+  fi
+  [ ! -f "$RUN_LOG" ] || sync "$RUN_LOG"
 }
 
 validate_source_archive() {
@@ -143,7 +213,7 @@ PY
 }
 
 prepare_source() {
-  local actual_commit supplied_archive supplied_sha harness_source harness_running
+  local actual_commit supplied_archive supplied_sha relative source_hash running_hash
   supplied_archive="${AIOPS_SOURCE_ARCHIVE:-}"
   supplied_sha="${AIOPS_SOURCE_ARCHIVE_SHA256:-}"
   if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -179,9 +249,14 @@ prepare_source() {
   mkdir -p "$SOURCE_DIR"
   tar -xf "$SOURCE_ARCHIVE" -C "$SOURCE_DIR"
   [ "$(<"$SOURCE_DIR/.aiops-source-commit")" = "$COMMIT_SHA" ] || fail "source archive commit marker does not match"
-  harness_source="$(sha256sum "$SOURCE_DIR/scripts/test-r0-clean-vm-matrix.sh" | awk '{print $1}')"
-  harness_running="$(sha256sum "$ROOT_DIR/scripts/test-r0-clean-vm-matrix.sh" | awk '{print $1}')"
-  [ "$harness_source" = "$harness_running" ] || fail "running harness does not match the source archive"
+  for relative in scripts/test-r0-clean-vm-matrix.sh scripts/generate-r0-matrix-summary.py; do
+    source_hash="$(sha256sum "$SOURCE_DIR/$relative" | awk '{print $1}')"
+    running_hash="$(sha256sum "$ROOT_DIR/$relative" | awk '{print $1}')"
+    [ "$source_hash" = "$running_hash" ] || fail "running $relative does not match the source archive"
+    if [ "$relative" = "scripts/generate-r0-matrix-summary.py" ]; then
+      SUMMARY_GENERATOR_SHA256="$source_hash"
+    fi
+  done
   HOST_BACKEND_IMAGE="${AIOPS_R0_HOST_BACKEND_IMAGE:-agent-ops-backend:r0-matrix-$RUN_ID}"
   HOST_FRONTEND_IMAGE="${AIOPS_R0_HOST_FRONTEND_IMAGE:-agent-ops-frontend:r0-matrix-$RUN_ID}"
   HOST_TEST_IMAGE="${AIOPS_R0_HOST_TEST_IMAGE:-agent-ops-backend-test:r0-matrix-$RUN_ID}"
@@ -195,17 +270,23 @@ build_diagnostic_images() {
 }
 
 cleanup_registry() {
-  local attempt
+  local attempt backend_ref frontend_ref
+  if [ "$REGISTRY_OWNED" = "0" ]; then
+    return 0
+  fi
+  backend_ref="$HOST_REGISTRY/agent-ops-backend:$REGISTRY_TAG"
+  frontend_ref="$HOST_REGISTRY/agent-ops-frontend:$REGISTRY_TAG"
   if docker container inspect "$REGISTRY_NAME" >/dev/null 2>&1; then
     docker rm -f "$REGISTRY_NAME" >/dev/null
   fi
   ! docker container inspect "$REGISTRY_NAME" >/dev/null 2>&1 || return 1
-  docker image rm \
-    "$HOST_REGISTRY/agent-ops-backend:$REGISTRY_TAG" \
-    "$HOST_REGISTRY/agent-ops-frontend:$REGISTRY_TAG" >/dev/null 2>&1 || true
+  docker image rm "$backend_ref" "$frontend_ref" >/dev/null 2>&1 || true
+  ! docker image inspect "$backend_ref" >/dev/null 2>&1 || return 1
+  ! docker image inspect "$frontend_ref" >/dev/null 2>&1 || return 1
   for attempt in $(seq 1 20); do
     if ! ss -H -ltn | awk -v suffix=":$REGISTRY_PORT" '$4 ~ suffix "$" {found=1} END {exit !found}'; then
       REGISTRY_STARTED=0
+      REGISTRY_OWNED=0
       return 0
     fi
     sleep 0.25
@@ -213,7 +294,7 @@ cleanup_registry() {
   return 1
 }
 
-cleanup_success_artifacts() {
+cleanup_success_image_artifacts() {
   local image
   for image in "$HOST_BACKEND_IMAGE" "$HOST_FRONTEND_IMAGE" "$HOST_TEST_IMAGE"; do
     [ -n "$image" ] || continue
@@ -221,9 +302,13 @@ cleanup_success_artifacts() {
     ! docker image inspect "$image" >/dev/null 2>&1 || \
       fail "successful run left diagnostic image tag $image"
   done
+}
+
+cleanup_success_run_artifacts() {
   if [ "$KEEP_VMS" = "0" ]; then
-    rm -rf "$RUN_DIR"
-    [ ! -e "$RUN_DIR" ] || fail "successful run directory was not removed"
+    rm -rf "$RUN_DIR" || return 1
+    [ ! -e "$RUN_DIR" ] || return 1
+    RUN_DIR_OWNED=0
   fi
 }
 
@@ -232,6 +317,7 @@ push_release_images() {
   local frontend_ref="$HOST_REGISTRY/agent-ops-frontend:$REGISTRY_TAG"
   local backend_repo frontend_repo
   retry_host_command docker pull "$REGISTRY_IMAGE" >/dev/null
+  REGISTRY_OWNED=1
   docker run --detach --rm \
     --name "$REGISTRY_NAME" \
     --publish "127.0.0.1:$REGISTRY_PORT:5000" \
@@ -313,9 +399,11 @@ remove_namespaced_vm() {
     sudo virsh undefine "$name" >/dev/null
   fi
   ! sudo virsh dominfo "$name" >/dev/null 2>&1 || fail "VM $name still exists after undefine"
-  sudo rm -f "$IMAGE_ROOT/$name.qcow2" "$IMAGE_ROOT/$name-seed.img"
+  sudo rm -f "$IMAGE_ROOT/$name.qcow2" "$IMAGE_ROOT/$name-data.qcow2" "$IMAGE_ROOT/$name-seed.img"
   rm -f "$RUN_DIR/$name-user-data.yaml" "$RUN_DIR/$name-meta-data.yaml" "$RUN_DIR/$name-seed.img"
-  [ ! -e "$IMAGE_ROOT/$name.qcow2" ] && [ ! -e "$IMAGE_ROOT/$name-seed.img" ] || \
+  [ ! -e "$IMAGE_ROOT/$name.qcow2" ] && \
+    [ ! -e "$IMAGE_ROOT/$name-data.qcow2" ] && \
+    [ ! -e "$IMAGE_ROOT/$name-seed.img" ] || \
     fail "VM $name disk artifacts were not removed"
 }
 
@@ -348,6 +436,7 @@ packages:
   - python3-venv
   - qemu-guest-agent
   - rsync
+  - xfsprogs
 runcmd:
   - [systemctl, enable, --now, qemu-guest-agent]
 EOF
@@ -363,11 +452,23 @@ create_vm() {
   local name="$1"
   local base_image="$2"
   local os_variant="$3"
+  local data_filesystem="$4"
   local disk="$IMAGE_ROOT/$name.qcow2"
+  local data_disk="$IMAGE_ROOT/$name-data.qcow2"
+  local -a data_disk_args=()
 
   ! sudo virsh dominfo "$name" >/dev/null 2>&1 || fail "refusing to replace existing VM $name"
-  [ ! -e "$disk" ] && [ ! -e "$IMAGE_ROOT/$name-seed.img" ] || \
+  [ ! -e "$disk" ] && [ ! -e "$data_disk" ] && [ ! -e "$IMAGE_ROOT/$name-seed.img" ] || \
     fail "refusing to replace existing disk artifacts for $name"
+  case "$data_filesystem" in
+    ext4) ;;
+    xfs)
+      sudo qemu-img create -q -f qcow2 "$data_disk" "$VM_DATA_DISK_SIZE"
+      sudo chown libvirt-qemu:kvm "$data_disk"
+      data_disk_args=(--disk "path=$data_disk,format=qcow2,bus=virtio,target=vdb,serial=aiops-r0-data,cache=none,discard=unmap")
+      ;;
+    *) fail "unsupported clean-VM data filesystem: $data_filesystem" ;;
+  esac
   sudo qemu-img create -q -f qcow2 -F qcow2 -b "$base_image" "$disk" "$VM_DISK_SIZE"
   sudo chown libvirt-qemu:kvm "$disk"
   create_cloud_init_seed "$name"
@@ -379,12 +480,71 @@ create_vm() {
     --cpu host \
     --import \
     --os-variant "$os_variant" \
-    --disk "path=$disk,format=qcow2,bus=virtio,cache=none,discard=unmap" \
+    --disk "path=$disk,format=qcow2,bus=virtio,target=vda,cache=none,discard=unmap" \
+    "${data_disk_args[@]}" \
     --disk "path=$IMAGE_ROOT/$name-seed.img,device=cdrom,readonly=on" \
     --network network=default,model=virtio \
     --graphics none \
     --console pty,target_type=serial \
     --noautoconsole >/dev/null
+}
+
+prepare_vm_data_filesystem() {
+  local ip="$1"
+  local expected_filesystem="$2"
+  local expected_data_disk_size="$3"
+  local -a options
+  mapfile -t options < <(ssh_args)
+  ssh "${options[@]}" "aiops@$ip" bash -s -- "$expected_filesystem" "$expected_data_disk_size" <<'REMOTE'
+set -euo pipefail
+expected_filesystem="$1"
+expected_data_disk_size="$2"
+sudo install -d -m 0711 /var/lib/docker
+case "$expected_filesystem" in
+  ext4)
+    [ "$(findmnt -no FSTYPE -T /var/lib/docker)" = "ext4" ] || {
+      echo "/var/lib/docker is not backed by ext4" >&2
+      exit 1
+    }
+    ;;
+  xfs)
+    sudo udevadm settle
+    stable_device=/dev/disk/by-id/virtio-aiops-r0-data
+    [ -b "$stable_device" ] || { echo "dedicated xfs data disk identity is missing" >&2; exit 1; }
+    data_device="$(readlink -f "$stable_device")"
+    [ "$data_device" = "/dev/vdb" ] || { echo "unexpected xfs data device: $data_device" >&2; exit 1; }
+    root_source="$(readlink -f "$(findmnt -no SOURCE /)")"
+    root_parent="$(lsblk -no PKNAME "$root_source" | head -1)"
+    [ -n "$root_parent" ] || { echo "root block device could not be resolved" >&2; exit 1; }
+    [ "$data_device" != "/dev/$root_parent" ] || { echo "refusing to format the root disk" >&2; exit 1; }
+    [ "$(sudo blockdev --getsize64 "$data_device")" = "$(numfmt --from=iec "$expected_data_disk_size")" ] || {
+      echo "xfs data disk size does not match the requested fixture" >&2
+      exit 1
+    }
+    [ "$(lsblk -nrpo TYPE "$data_device")" = "disk" ] || { echo "xfs data disk has partitions" >&2; exit 1; }
+    ! find "/sys/class/block/$(basename "$data_device")/holders" -mindepth 1 -print -quit | grep -q . || {
+      echo "xfs data disk has active holders" >&2
+      exit 1
+    }
+    ! findmnt "$data_device" >/dev/null 2>&1 || { echo "$data_device is already mounted" >&2; exit 1; }
+    [ -z "$(sudo blkid -o value -s TYPE "$data_device" 2>/dev/null || true)" ] || {
+      echo "$data_device unexpectedly contains a filesystem" >&2
+      exit 1
+    }
+    sudo mkfs.xfs -f -L aiops-docker "$data_device" >/dev/null
+    uuid="$(sudo blkid -o value -s UUID "$data_device")"
+    [ -n "$uuid" ] || { echo "xfs data disk UUID could not be resolved" >&2; exit 1; }
+    printf 'UUID=%s /var/lib/docker xfs defaults 0 2\n' "$uuid" | sudo tee -a /etc/fstab >/dev/null
+    sudo mount /var/lib/docker
+    [ "$(findmnt -no FSTYPE -T /var/lib/docker)" = "xfs" ]
+    mounted_source="$(readlink -f "$(findmnt -no SOURCE -T /var/lib/docker)")"
+    [ "$mounted_source" = "$data_device" ] || { echo "xfs mount source does not match the dedicated disk" >&2; exit 1; }
+    [ "$(sudo blkid -o value -s UUID "$mounted_source")" = "$uuid" ] || { echo "xfs mount UUID mismatch" >&2; exit 1; }
+    sudo xfs_info /var/lib/docker | grep -Eq 'ftype=1([[:space:]]|$)'
+    ;;
+  *) echo "unsupported data filesystem: $expected_filesystem" >&2; exit 1 ;;
+esac
+REMOTE
 }
 
 wait_for_vm_ip() {
@@ -567,6 +727,7 @@ run_vm_gate() {
   local compose_package="$9"
   local cloud_release="${10}"
   local cloud_image_sha256="${11}"
+  local expected_data_filesystem="${12}"
   local log="$EVIDENCE_DIR/$evidence_name-$RUN_ID.log"
   local manifest="$EVIDENCE_DIR/$evidence_name.json"
   local raw_log_path=".omx/evidence/production-ga/GA-R0-001/$evidence_name-$RUN_ID.log"
@@ -575,7 +736,7 @@ run_vm_gate() {
 
   set +e
   ssh "${options[@]}" "aiops@$ip" \
-    "AIOPS_EVIDENCE_NAME='$evidence_name' AIOPS_RAW_LOG_PATH='$raw_log_path' AIOPS_EXPECTED_OS='$expected_os' AIOPS_EXPECTED_DOCKER_ENGINE='$engine_version' AIOPS_DOCKER_CE_PACKAGE='$docker_package' AIOPS_CONTAINERD_PACKAGE='$containerd_package' AIOPS_BUILDX_PACKAGE='$buildx_package' AIOPS_COMPOSE_PACKAGE='$compose_package' AIOPS_CLOUD_RELEASE='$cloud_release' AIOPS_CLOUD_IMAGE_SHA256='$cloud_image_sha256' AIOPS_CLOUD_KEY_FINGERPRINT='$CLOUD_KEY_FINGERPRINT' AIOPS_DOCKER_GPG_FINGERPRINT='$DOCKER_GPG_FINGERPRINT' AIOPS_REGISTRY_IMAGE='$REGISTRY_IMAGE' AIOPS_SOURCE_ARCHIVE_SHA256='$SOURCE_ARCHIVE_SHA256' AIOPS_EXPECTED_BACKEND_DIGEST='$HOST_BACKEND_DIGEST' AIOPS_EXPECTED_FRONTEND_DIGEST='$HOST_FRONTEND_DIGEST' AIOPS_BACKEND_IMAGE_REF='$VM_REGISTRY/agent-ops-backend@$HOST_BACKEND_DIGEST' AIOPS_FRONTEND_IMAGE_REF='$VM_REGISTRY/agent-ops-frontend@$HOST_FRONTEND_DIGEST' AIOPS_SOURCE_COMMIT='$COMMIT_SHA' bash -s" \
+    "AIOPS_EVIDENCE_NAME='$evidence_name' AIOPS_RAW_LOG_PATH='$raw_log_path' AIOPS_EXPECTED_OS='$expected_os' AIOPS_EXPECTED_DATA_FILESYSTEM='$expected_data_filesystem' AIOPS_EXPECTED_DOCKER_ENGINE='$engine_version' AIOPS_DOCKER_CE_PACKAGE='$docker_package' AIOPS_CONTAINERD_PACKAGE='$containerd_package' AIOPS_BUILDX_PACKAGE='$buildx_package' AIOPS_COMPOSE_PACKAGE='$compose_package' AIOPS_CLOUD_RELEASE='$cloud_release' AIOPS_CLOUD_IMAGE_SHA256='$cloud_image_sha256' AIOPS_CLOUD_KEY_FINGERPRINT='$CLOUD_KEY_FINGERPRINT' AIOPS_DOCKER_GPG_FINGERPRINT='$DOCKER_GPG_FINGERPRINT' AIOPS_REGISTRY_IMAGE='$REGISTRY_IMAGE' AIOPS_SOURCE_ARCHIVE_SHA256='$SOURCE_ARCHIVE_SHA256' AIOPS_EXPECTED_BACKEND_DIGEST='$HOST_BACKEND_DIGEST' AIOPS_EXPECTED_FRONTEND_DIGEST='$HOST_FRONTEND_DIGEST' AIOPS_BACKEND_IMAGE_REF='$VM_REGISTRY/agent-ops-backend@$HOST_BACKEND_DIGEST' AIOPS_FRONTEND_IMAGE_REF='$VM_REGISTRY/agent-ops-frontend@$HOST_FRONTEND_DIGEST' AIOPS_SOURCE_COMMIT='$COMMIT_SHA' bash -s" \
     <<'REMOTE' 2>&1 | tee "$log"
 set -euo pipefail
 umask 077
@@ -585,7 +746,15 @@ export AIOPS_COMMIT_SHA="$AIOPS_SOURCE_COMMIT"
 . /etc/os-release
 [ "$VERSION_ID" = "$AIOPS_EXPECTED_OS" ]
 [ "$(uname -m)" = "x86_64" ]
-case "$(findmnt -no FSTYPE /)" in ext4|xfs) ;; *) echo "root filesystem is outside support policy" >&2; exit 1 ;; esac
+root_filesystem="$(findmnt -no FSTYPE /)"
+case "$root_filesystem" in ext4|xfs) ;; *) echo "root filesystem is outside support policy" >&2; exit 1 ;; esac
+data_filesystem="$(sudo findmnt -no FSTYPE -T /var/lib/docker)"
+[ "$data_filesystem" = "$AIOPS_EXPECTED_DATA_FILESYSTEM" ] || {
+  echo "Docker data filesystem mismatch: expected $AIOPS_EXPECTED_DATA_FILESYSTEM, got $data_filesystem" >&2
+  exit 1
+}
+docker_root_dir="$(docker info --format '{{.DockerRootDir}}')"
+[ "$docker_root_dir" = "/var/lib/docker" ] || { echo "unexpected Docker root: $docker_root_dir" >&2; exit 1; }
 [ "$(docker version --format '{{.Server.Version}}')" = "$AIOPS_EXPECTED_DOCKER_ENGINE" ]
 docker image inspect "$AIOPS_BACKEND_IMAGE_REF" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep -F "@$AIOPS_EXPECTED_BACKEND_DIGEST" >/dev/null
 docker image inspect "$AIOPS_FRONTEND_IMAGE_REF" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep -F "@$AIOPS_EXPECTED_FRONTEND_DIGEST" >/dev/null
@@ -605,14 +774,23 @@ chmod 0700 "$python_wrapper"
 export AIOPS_WRAPPER_ROOT="$PWD"
 AIOPS_PYTHON_BIN="$python_wrapper" ./scripts/verify-production-baseline.sh
 rm -f "$python_wrapper"
-AIOPS_RUN_PRODUCTION_PLAYWRIGHT=0 AIOPS_PRESERVE_ON_FAILURE=1 ./scripts/test-production-compose.sh
 mkdir -p .omx/evidence/production-ga/GA-R0-001
+storage_evidence_path=".omx/evidence/production-ga/GA-R0-001/${AIOPS_EVIDENCE_NAME}-storage.json"
+AIOPS_RUN_PRODUCTION_PLAYWRIGHT=0 AIOPS_PRESERVE_ON_FAILURE=1 \
+  AIOPS_EXPECTED_DATA_FILESYSTEM="$AIOPS_EXPECTED_DATA_FILESYSTEM" \
+  AIOPS_DATA_FILESYSTEM_EVIDENCE_FILE="$storage_evidence_path" \
+  ./scripts/test-production-compose.sh
+[ -f "$storage_evidence_path" ] || { echo "SQLite storage evidence was not written" >&2; exit 1; }
+export AIOPS_DATA_FILESYSTEM_EVIDENCE_FILE="$storage_evidence_path"
 export AIOPS_BACKEND_CONFIG_ID="$(docker image inspect agent-ops-backend:r0-ci --format '{{.Id}}')"
 export AIOPS_FRONTEND_CONFIG_ID="$(docker image inspect agent-ops-frontend:r0-ci --format '{{.Id}}')"
 export AIOPS_DOCKER_VERSION="$(docker version --format '{{.Server.Version}}')"
 export AIOPS_COMPOSE_VERSION="$(docker compose version --short)"
 export AIOPS_KERNEL="$(uname -r)"
-export AIOPS_FILESYSTEM="$(findmnt -no FSTYPE /)"
+export AIOPS_ROOT_FILESYSTEM="$root_filesystem"
+export AIOPS_DATA_FILESYSTEM="$data_filesystem"
+export AIOPS_DOCKER_ROOT_DIR="$docker_root_dir"
+export AIOPS_DOCKER_STORAGE_DRIVER="$(docker info --format '{{.Driver}}')"
 python3 - <<'PY'
 import json
 import os
@@ -620,11 +798,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 name = os.environ["AIOPS_EVIDENCE_NAME"]
+sqlite_storage = json.loads(Path(os.environ["AIOPS_DATA_FILESYSTEM_EVIDENCE_FILE"]).read_text(encoding="utf-8"))
 payload = {
     "test_id": "GA-R0-001",
     "requirement": "clean Ubuntu x86_64 production fail-closed, setup, health and topology gate",
     "automation": "signed cloud image -> exact Docker packages -> pytest + static probe + production Compose runtime",
-    "environment": f"Ubuntu {os.environ['AIOPS_EXPECTED_OS']} x86_64 clean KVM VM",
+    "environment": f"Ubuntu {os.environ['AIOPS_EXPECTED_OS']} x86_64 clean KVM VM with {os.environ['AIOPS_EXPECTED_DATA_FILESYSTEM']} Docker/SQLite data",
+    "evidence_name": name,
+    "os_version": os.environ["AIOPS_EXPECTED_OS"],
+    "data_filesystem": os.environ["AIOPS_EXPECTED_DATA_FILESYSTEM"],
     "fixture_or_seed": "GPG-verified official Ubuntu cloud image, exact shared OCI digests, ephemeral SQLite and one-time setup token",
     "sample_size_or_duration": "full backend suite and one complete production Compose setup/restart/runtime cycle",
     "expected": "all R0 local gates pass while Worker, Agent, mutation and unverified LLM remain fail-closed",
@@ -642,7 +824,11 @@ payload = {
     "docker_gpg_fingerprint": os.environ["AIOPS_DOCKER_GPG_FINGERPRINT"],
     "registry_image": os.environ["AIOPS_REGISTRY_IMAGE"],
     "kernel": os.environ["AIOPS_KERNEL"],
-    "filesystem": os.environ["AIOPS_FILESYSTEM"],
+    "filesystem": os.environ["AIOPS_DATA_FILESYSTEM"],
+    "root_filesystem": os.environ["AIOPS_ROOT_FILESYSTEM"],
+    "docker_root_dir": os.environ["AIOPS_DOCKER_ROOT_DIR"],
+    "docker_storage_driver": os.environ["AIOPS_DOCKER_STORAGE_DRIVER"],
+    "sqlite_storage": sqlite_storage,
     "docker_engine": os.environ["AIOPS_DOCKER_VERSION"],
     "docker_compose": os.environ["AIOPS_COMPOSE_VERSION"],
     "docker_ce_package": os.environ["AIOPS_DOCKER_CE_PACKAGE"],
@@ -709,10 +895,14 @@ sanitize_and_power_off_vm() {
 
 scan_current_evidence_for_secrets() {
   python3 - "$RUN_LOG" \
-    "$EVIDENCE_DIR/agent-ops-r0-ubuntu2204-$RUN_ID.log" \
-    "$EVIDENCE_DIR/agent-ops-r0-ubuntu2404-$RUN_ID.log" \
-    "$EVIDENCE_DIR/agent-ops-r0-ubuntu2204.json" \
-    "$EVIDENCE_DIR/agent-ops-r0-ubuntu2404.json" <<'PY'
+    "$EVIDENCE_DIR/agent-ops-r0-ubuntu2204-ext4-$RUN_ID.log" \
+    "$EVIDENCE_DIR/agent-ops-r0-ubuntu2204-xfs-$RUN_ID.log" \
+    "$EVIDENCE_DIR/agent-ops-r0-ubuntu2404-ext4-$RUN_ID.log" \
+    "$EVIDENCE_DIR/agent-ops-r0-ubuntu2404-xfs-$RUN_ID.log" \
+    "$EVIDENCE_DIR/agent-ops-r0-ubuntu2204-ext4.json" \
+    "$EVIDENCE_DIR/agent-ops-r0-ubuntu2204-xfs.json" \
+    "$EVIDENCE_DIR/agent-ops-r0-ubuntu2404-ext4.json" \
+    "$EVIDENCE_DIR/agent-ops-r0-ubuntu2404-xfs.json" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -720,9 +910,21 @@ from pathlib import Path
 patterns = (
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     re.compile(r"(?i)authorization:\s*bearer\s+[A-Za-z0-9._~+/=-]{8,}"),
-    re.compile(r"AIOPS_(?:SESSION_SECRET|LLM_API_KEY|SETUP_TOKEN)=[^\s]+"),
-    re.compile(r'(?i)"(?:(?:llm[_-]?)?api[_-]?key|session[_-]?secret|setup[_-]?token|password)"\s*:\s*"(?!\*{3}|<redacted>)[^"\s]{8,}"'),
+    re.compile(r"(?:AIOPS_)?(?:SESSION_SECRET|LLM_API_KEY|DEEPSEEK_API_KEY|SETUP_TOKEN)=[^\s]+"),
+    re.compile(r'(?i)"(?:token|deepseek[_-]?api[_-]?key|(?:llm[_-]?)?api[_-]?key|session[_-]?secret|setup[_-]?token|password)"\s*:\s*"(?!\*{3}|<redacted>)[^"\s]{8,}"'),
 )
+positive_fixtures = (
+    'AIOPS_DEEPSEEK_API_KEY=fixture-secret-value',
+    'DEEPSEEK_API_KEY=fixture-secret-value',
+    '{"token":"fixture-secret-value"}',
+    '{"deepseek_api_key":"fixture-secret-value"}',
+)
+for fixture in positive_fixtures:
+    if not any(pattern.search(fixture) for pattern in patterns):
+        raise SystemExit(f"secret scanner self-test missed fixture: {fixture.split('=')[0]}")
+for fixture in ('{"token":"<redacted>"}', '{"password":"********"}'):
+    if any(pattern.search(fixture) for pattern in patterns):
+        raise SystemExit("secret scanner self-test rejected a redacted fixture")
 for raw_path in sys.argv[1:]:
     path = Path(raw_path)
     if not path.exists():
@@ -735,61 +937,54 @@ PY
 }
 
 generate_matrix_summary() {
-  python3 - "$ROOT_DIR" "$EVIDENCE_DIR" "$COMMIT_SHA" "$SOURCE_ARCHIVE_SHA256" "$REGISTRY_IMAGE" "$RUN_ID" <<'PY'
-import hashlib
-import json
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-
-root = Path(sys.argv[1])
-evidence_dir = Path(sys.argv[2])
-commit, source_sha, registry_image, run_id = sys.argv[3:]
-names = ("agent-ops-r0-ubuntu2204", "agent-ops-r0-ubuntu2404")
-runs = [json.loads((evidence_dir / f"{name}.json").read_text(encoding="utf-8")) for name in names]
-for run in runs:
-    assert run["result"] == "passed"
-    assert run["commit_sha"] == commit
-    assert run["source_archive_sha256"] == source_sha
-    assert run["registry_image"] == registry_image
-assert len({run["release_digest"] for run in runs}) == 1
-assert len({run["frontend_release_digest"] for run in runs}) == 1
-
-hashes = {}
-for run in runs:
-    for key in ("evidence_path", "raw_log_path"):
-        path = root / run[key]
-        hashes[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
-
-payload = {
-    "test_id": "GA-R0-001",
-    "requirement": "production fail-closed and clean Ubuntu 22.04/24.04 matrix on identical OCI manifests",
-    "automation": "scripts/test-r0-clean-vm-matrix.sh",
-    "environment": [run["environment"] for run in runs],
-    "fixture_or_seed": "GPG-verified Ubuntu cloud images and exact commit archive",
-    "sample_size_or_duration": "2 clean VMs; 52 backend tests and one production Compose lifecycle per VM",
-    "expected": "both clean hosts pass with the same backend/frontend OCI digests",
-    "evidence_path": ".omx/evidence/production-ga/GA-R0-001/matrix-summary.json",
-    "owner": "backend and release leads",
-    "release_digest": runs[0]["release_digest"],
-    "frontend_release_digest": runs[0]["frontend_release_digest"],
-    "result": "passed",
-    "executed_at": datetime.now(timezone.utc).isoformat(),
-    "commit_sha": commit,
-    "source_archive_sha256": source_sha,
-    "registry_image": registry_image,
-    "run_id": run_id,
-    "evidence_sha256": hashes,
-    "runs": runs,
+  local staged_summary="$EVIDENCE_DIR/.matrix-summary.$RUN_ID.pending"
+  local staged_status="$EVIDENCE_DIR/.matrix-status.$RUN_ID.pending"
+  [ "$(sha256sum "$SOURCE_DIR/scripts/generate-r0-matrix-summary.py" | awk '{print $1}')" = \
+    "$SUMMARY_GENERATOR_SHA256" ] || fail "immutable matrix-summary generator changed during the run"
+  "$SOURCE_DIR/scripts/generate-r0-matrix-summary.py" --stage \
+    --root "$ROOT_DIR" \
+    --evidence-dir "$EVIDENCE_DIR" \
+    --commit "$COMMIT_SHA" \
+    --source-archive-sha256 "$SOURCE_ARCHIVE_SHA256" \
+    --registry-image "$REGISTRY_IMAGE" \
+    --run-id "$RUN_ID"
+  STAGED_SUMMARY_SHA256="$(sha256sum "$staged_summary" | awk '{print $1}')"
+  STAGED_STATUS_SHA256="$(sha256sum "$staged_status" | awk '{print $1}')"
 }
-output = evidence_dir / "matrix-summary.json"
-output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-output.chmod(0o600)
-PY
+
+publish_staged_matrix_summary() {
+  local staged_summary="$EVIDENCE_DIR/.matrix-summary.$RUN_ID.pending"
+  local staged_status="$EVIDENCE_DIR/.matrix-status.$RUN_ID.pending"
+  [ -f "$staged_summary" ] && [ ! -L "$staged_summary" ] || return 1
+  [ -f "$staged_status" ] && [ ! -L "$staged_status" ] || return 1
+  [ "$(sha256sum "$staged_summary" | awk '{print $1}')" = "$STAGED_SUMMARY_SHA256" ] || return 1
+  [ "$(sha256sum "$staged_status" | awk '{print $1}')" = "$STAGED_STATUS_SHA256" ] || return 1
+  mv -f "$staged_summary" "$EVIDENCE_DIR/matrix-summary.json" || return 1
+  if ! mv -f "$staged_status" "$EVIDENCE_DIR/matrix-status.json"; then
+    rm -f "$EVIDENCE_DIR/matrix-summary.json"
+    return 1
+  fi
+}
+
+invalidate_published_matrix_summary() {
+  rm -f \
+    "$EVIDENCE_DIR/matrix-summary.json" \
+    "$EVIDENCE_DIR/matrix-status.json" \
+    "$EVIDENCE_DIR/.matrix-summary.$RUN_ID.pending" \
+    "$EVIDENCE_DIR/.matrix-status.$RUN_ID.pending"
+}
+
+append_run_log() {
+  local message="$1"
+  if [ -f "$RUN_LOG" ]; then
+    printf '%s\n' "$message" | tee -a "$RUN_LOG"
+  else
+    printf '%s\n' "$message"
+  fi
 }
 
 cleanup_on_exit() {
-  local status=$? state
+  local status=$? state scan_output
   trap - EXIT
   if [ "$status" -ne 0 ]; then
     if [ -n "$CURRENT_VM_NAME" ]; then
@@ -813,16 +1008,65 @@ cleanup_on_exit() {
       fi
       [ ! -e "$IMAGE_ROOT/$CURRENT_VM_NAME.qcow2" ] || \
         echo "failure disk retained: $IMAGE_ROOT/$CURRENT_VM_NAME.qcow2" >&2
+      [ ! -e "$IMAGE_ROOT/$CURRENT_VM_NAME-data.qcow2" ] || \
+        echo "failure data disk retained: $IMAGE_ROOT/$CURRENT_VM_NAME-data.qcow2" >&2
     fi
     if ! cleanup_registry; then
       echo "CRITICAL: ephemeral registry cleanup failed: $REGISTRY_NAME on port $REGISTRY_PORT" >&2
       docker container inspect "$REGISTRY_NAME" >&2 2>/dev/null || true
       ss -H -ltnp | awk -v suffix=":$REGISTRY_PORT" '$4 ~ suffix "$"' >&2 || true
     fi
-    if ! scan_current_evidence_for_secrets; then
-      echo "CRITICAL: retained failure evidence may contain secret material; keep it mode 0600 and review before sharing" >&2
+    if ! finalize_run_log; then
+      append_run_log "CRITICAL: run log tee did not flush cleanly: $RUN_LOG" >&2
     fi
-    echo "run log retained: $RUN_LOG" >&2
+    if [ "$RUN_INITIALIZED" = "1" ]; then
+      if ! scan_output="$(scan_current_evidence_for_secrets 2>&1)"; then
+        append_run_log "$scan_output" >&2
+        append_run_log "CRITICAL: retained failure evidence may contain secret material; keep it mode 0600 and review before sharing" >&2
+      fi
+      append_run_log "run log retained: $RUN_LOG" >&2
+      sync "$RUN_LOG"
+    else
+      if [ -f "$RUN_LOG_OWNERSHIP_MARKER" ]; then
+        if python3 - "$RUN_LOG" "$RUN_LOG_OWNERSHIP_MARKER" <<'PY'
+import os
+import stat
+import sys
+
+path, marker = sys.argv[1:]
+no_follow = getattr(os, "O_NOFOLLOW", 0)
+if no_follow == 0:
+    raise SystemExit("O_NOFOLLOW is unavailable")
+marker_descriptor = os.open(marker, os.O_RDONLY | no_follow)
+try:
+    marker_stat = os.fstat(marker_descriptor)
+    if not stat.S_ISREG(marker_stat.st_mode):
+        raise SystemExit("run-log ownership marker is not a regular file")
+    expected = os.read(marker_descriptor, 128).decode("ascii").strip()
+finally:
+    os.close(marker_descriptor)
+try:
+    actual = os.lstat(path)
+except FileNotFoundError:
+    raise SystemExit(0)
+if not stat.S_ISREG(actual.st_mode) or f"{actual.st_dev}:{actual.st_ino}" != expected:
+    raise SystemExit("refusing to remove a run log not owned by this run")
+os.unlink(path)
+PY
+        then
+          RUN_LOG_OWNED=0
+        else
+          echo "CRITICAL: partial run log ownership could not be proven; retaining forensic artifacts" >&2
+        fi
+      fi
+      if [ "$RUN_LOG_OWNED" = "0" ] && [ "$RUN_DIR_OWNED" = "1" ] && [ -d "$RUN_DIR" ]; then
+        rm -rf "$RUN_DIR" || true
+        [ ! -e "$RUN_DIR" ] && RUN_DIR_OWNED=0
+      fi
+    fi
+    if [ "$MATRIX_OWNS_STATUS" = "1" ]; then
+      invalidate_published_matrix_summary
+    fi
   fi
   exit "$status"
 }
@@ -830,32 +1074,44 @@ cleanup_on_exit() {
 main() {
   local row suffix release os_variant expected_os engine_version docker_package
   local containerd_package buildx_package compose_package compose_version
-  local name evidence_name base_image base_image_sha256 ip
+  local data_filesystem name evidence_name base_image base_image_sha256 ip
+  local scan_output
+  local -A base_images=()
+  local -A base_image_hashes=()
 
   require_host
-  prepare_state
   trap cleanup_on_exit EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
+  prepare_state
   prepare_source
+  "$SOURCE_DIR/scripts/generate-r0-matrix-summary.py" \
+    --invalidate --root "$ROOT_DIR" --evidence-dir "$EVIDENCE_DIR" --run-id "$RUN_ID"
+  MATRIX_OWNS_STATUS=1
   build_diagnostic_images
   push_release_images
   for row in "${MATRIX[@]}"; do
     IFS='|' read -r suffix release os_variant expected_os engine_version docker_package \
-      containerd_package buildx_package compose_package compose_version <<< "$row"
+      containerd_package buildx_package compose_package compose_version data_filesystem <<< "$row"
     name="agent-ops-r0-$RUN_ID-$suffix"
     evidence_name="agent-ops-r0-$suffix"
-    base_image="$(download_verified_cloud_image "$release")"
-    base_image_sha256="$(sudo sha256sum "$base_image" | awk '{print $1}')"
+    if [ -z "${base_images[$release]:-}" ]; then
+      base_images[$release]="$(download_verified_cloud_image "$release")"
+      base_image_hashes[$release]="$(sudo sha256sum "${base_images[$release]}" | awk '{print $1}')"
+    fi
+    base_image="${base_images[$release]}"
+    base_image_sha256="${base_image_hashes[$release]}"
     CURRENT_VM_NAME="$name"
     CURRENT_VM_IP=""
-    echo "[$name] creating clean Ubuntu $expected_os VM"
-    create_vm "$name" "$base_image" "$os_variant"
+    echo "[$name] creating clean Ubuntu $expected_os VM with $data_filesystem Docker data"
+    create_vm "$name" "$base_image" "$os_variant" "$data_filesystem"
     ip="$(wait_for_vm_ip "$name")"
     CURRENT_VM_IP="$ip"
     echo "[$name] waiting for cloud-init at $ip"
     wait_for_cloud_init "$ip"
+    echo "[$name] preparing $data_filesystem Docker data filesystem"
+    prepare_vm_data_filesystem "$ip" "$data_filesystem" "$VM_DATA_DISK_SIZE"
     echo "[$name] installing Docker $engine_version"
     install_docker_exact "$ip" "$engine_version" "$docker_package" "$containerd_package" \
       "$buildx_package" "$compose_package" "$compose_version"
@@ -865,7 +1121,7 @@ main() {
     echo "[$name] running R0 blocking gates"
     run_vm_gate "$name" "$evidence_name" "$ip" "$expected_os" "$engine_version" \
       "$docker_package" "$containerd_package" "$buildx_package" "$compose_package" \
-      "$release" "$base_image_sha256"
+      "$release" "$base_image_sha256" "$data_filesystem"
     sanitize_and_power_off_vm "$name" "$ip" 1
     if [ "$KEEP_VMS" = "1" ]; then
       echo "[$name] passed and was retained offline with its original Docker daemon configuration"
@@ -876,12 +1132,28 @@ main() {
     CURRENT_VM_NAME=""
     CURRENT_VM_IP=""
   done
-  scan_current_evidence_for_secrets
   cleanup_registry || fail "ephemeral registry or listening port was not removed"
   REGISTRY_STARTED=0
-  cleanup_success_artifacts
+  cleanup_success_image_artifacts
+  finalize_run_log || fail "run log tee did not flush cleanly"
+  if ! scan_output="$(scan_current_evidence_for_secrets 2>&1)"; then
+    append_run_log "$scan_output" >&2
+    fail "secret material was found in completed matrix evidence"
+  fi
   generate_matrix_summary
-  echo "R0 clean-VM matrix passed"
+  cleanup_success_run_artifacts || fail "successful run directory was not removed"
+  append_run_log "R0 matrix cleanup completed and the staged evidence passed secret scanning"
+  sync "$RUN_LOG"
+  scan_current_evidence_for_secrets
+  publish_staged_matrix_summary || fail "staged matrix summary could not be atomically published"
+  append_run_log "R0 clean-VM matrix passed"
+  sync "$RUN_LOG"
+  if ! scan_output="$(scan_current_evidence_for_secrets 2>&1)"; then
+    invalidate_published_matrix_summary
+    append_run_log "$scan_output" >&2
+    fail "secret material appeared after matrix summary publication"
+  fi
+  MATRIX_OWNS_STATUS=0
 }
 
 main "$@"

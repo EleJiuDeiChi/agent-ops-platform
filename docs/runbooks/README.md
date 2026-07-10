@@ -128,7 +128,8 @@ write a success task/event.
 For the R0 clean-host gate, run the following only on the designated Linux KVM
 lab host with passwordless sudo and the libvirt `default` network. It downloads
 Ubuntu official cloud images, verifies their published SHA-256 sums, creates
-namespaced disposable guests and destroys them after success:
+namespaced disposable guests and destroys them after success. The xfs cases
+also attach a dedicated disposable data disk before Docker installation:
 
 ```bash
 AIOPS_SOURCE_COMMIT="$(git rev-parse HEAD)" \
@@ -146,8 +147,12 @@ it is not described as independently signed:
 ```
 
 The harness must report the same backend and frontend OCI manifest digests for
-Ubuntu 22.04/Docker 28 and Ubuntu 24.04/Docker 29. A `docker save/load` config
-ID or a container pretending to be a VM is not accepted evidence.
+Ubuntu 22.04/Docker 28 and Ubuntu 24.04/Docker 29 across both ext4 and xfs.
+It must also prove that Docker's real data root and the production SQLite named
+volume use the expected filesystem and that the database passes SQLite
+`quick_check`. A `docker save/load` config ID, an
+unrelated xfs test directory or a container pretending to be a VM is not
+accepted evidence.
 
 ## 5. Stop, rollback and recovery limitations
 

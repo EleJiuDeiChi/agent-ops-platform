@@ -30,6 +30,7 @@ required_files=(
   scripts/assert-production-topology.py
   scripts/test-production-compose.sh
   scripts/test-r0-clean-vm-matrix.sh
+  scripts/generate-r0-matrix-summary.py
   scripts/run-r0-clean-vm-matrix-devbox.sh
 )
 
@@ -43,19 +44,24 @@ done
 "$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/probe-llm-contract.py"
 "$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/assert-production-topology.py"
 "$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/verify-release-attestations.py"
+"$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/generate-r0-matrix-summary.py"
 "$PYTHON_BIN" "$ROOT_DIR/scripts/probe-llm-contract.py" --help >/dev/null
 "$PYTHON_BIN" "$ROOT_DIR/scripts/verify-release-attestations.py" --self-test
+PYTHONOPTIMIZE=1 "$PYTHON_BIN" "$ROOT_DIR/scripts/generate-r0-matrix-summary.py" --self-test
 "$ROOT_DIR/scripts/deploy-production.sh" --help >/dev/null
 "$ROOT_DIR/scripts/assert-production-topology.py" --help >/dev/null
 
 for marker in "ubuntu-cloudimage-keyring" "source_archive_sha256" \
-  "docker_ce_package" "registry@sha256:" "cleanup_success_artifacts" \
-  "VALIDSIG" "exactly one primary key" "scan_current_evidence_for_secrets"; do
+  "docker_ce_package" "registry@sha256:" "cleanup_success_run_artifacts" \
+  "VALIDSIG" "exactly one primary key" "scan_current_evidence_for_secrets" \
+  "AIOPS_EXPECTED_DATA_FILESYSTEM" "VM_DATA_DISK_SIZE" "xfs_info" \
+  "virtio-aiops-r0-data" "finalize_run_log"; do
   grep -q "$marker" "$ROOT_DIR/scripts/test-r0-clean-vm-matrix.sh" || {
     echo "clean-VM evidence marker is missing: $marker" >&2
     exit 1
   }
 done
+grep -q 'SQLite named volume verified on' "$ROOT_DIR/scripts/test-production-compose.sh"
 
 for marker in "syft-version: v1.46.0" "version: v0.72.0" "cosign-release: v3.1.1" \
   "provenance: mode=max" "environment:" "production-release" \

@@ -48,19 +48,44 @@ COMPOSE_PROD=(docker compose -p "$PROJECT_NAME" -f "$ROOT_DIR/deploy/compose.pro
 COMPOSE_SETUP=(docker compose -p "$PROJECT_NAME" -f "$ROOT_DIR/deploy/compose.prod.yml" -f "$ROOT_DIR/deploy/compose.setup.yml")
 
 cleanup() {
-  local status=$?
+  local status=$? remaining_containers
+  trap - EXIT
   if [ "$status" -ne 0 ]; then
     echo "production Compose validation failed; preserving diagnostics before cleanup" >&2
     "${COMPOSE_PROD[@]}" ps >&2 || true
     "${COMPOSE_PROD[@]}" logs --no-color --tail 200 >&2 || true
     if [ "$PRESERVE_ON_FAILURE" = "1" ]; then
       echo "runtime containers, volume and secret fixture retained for offline VM forensics" >&2
-      return "$status"
+      exit "$status"
     fi
+    "${COMPOSE_PROD[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || \
+      echo "warning: failed test topology could not be fully removed" >&2
+    rm -rf "$TMP_DIR"
+    exit "$status"
   fi
-  "${COMPOSE_PROD[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
+  if ! "${COMPOSE_PROD[@]}" down --volumes --remove-orphans >/dev/null 2>&1; then
+    echo "successful validation could not remove the production Compose topology" >&2
+    exit 1
+  fi
+  remaining_containers="$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT_NAME")"
+  [ -z "$remaining_containers" ] || {
+    echo "successful validation left Compose containers: $remaining_containers" >&2
+    exit 1
+  }
+  ! docker network inspect "${PROJECT_NAME}_app_internal" >/dev/null 2>&1 || {
+    echo "successful validation left the Compose network" >&2
+    exit 1
+  }
+  ! docker volume inspect "${PROJECT_NAME}_aiops_data" >/dev/null 2>&1 || {
+    echo "successful validation left the SQLite volume" >&2
+    exit 1
+  }
   rm -rf "$TMP_DIR"
-  return "$status"
+  [ ! -e "$TMP_DIR" ] || {
+    echo "successful validation left its secret fixture directory" >&2
+    exit 1
+  }
+  exit 0
 }
 trap cleanup EXIT
 
@@ -113,10 +138,14 @@ import sys
 
 payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
 expected = sys.argv[2].split(",") if sys.argv[2] else []
-assert payload["status"] == "not_ready", payload
-assert payload["reasons"] == expected, payload
-assert payload["dependencies"]["worker"]["status"] == "disabled_by_release_gate", payload
-assert payload["dependencies"]["agent"]["status"] == "disabled_by_release_gate", payload
+if payload.get("status") != "not_ready":
+    raise SystemExit(f"unexpected readiness status: {payload!r}")
+if payload.get("reasons") != expected:
+    raise SystemExit(f"unexpected readiness reasons: {payload!r}")
+if payload.get("dependencies", {}).get("worker", {}).get("status") != "disabled_by_release_gate":
+    raise SystemExit(f"Worker release gate is not closed: {payload!r}")
+if payload.get("dependencies", {}).get("agent", {}).get("status") != "disabled_by_release_gate":
+    raise SystemExit(f"Agent release gate is not closed: {payload!r}")
 PY
 }
 
@@ -152,11 +181,60 @@ assert_readiness "llm_unverified"
 curl -kfsS "https://127.0.0.1:$HTTPS_PORT/version" | python3 -c '
 import json, sys
 payload = json.load(sys.stdin)
-assert payload["environment"] == "prod", payload
-assert payload["provenance"]["status"] == "declared", payload
-assert payload["release_digest"], payload
-assert payload["commit_sha"], payload
+if payload.get("environment") != "prod":
+    raise SystemExit(f"unexpected runtime environment: {payload!r}")
+if payload.get("provenance", {}).get("status") != "declared":
+    raise SystemExit(f"runtime provenance is not declared: {payload!r}")
+if not payload.get("release_digest") or not payload.get("commit_sha"):
+    raise SystemExit(f"runtime provenance fields are incomplete: {payload!r}")
 '
+
+if [ -n "${AIOPS_EXPECTED_DATA_FILESYSTEM:-}" ]; then
+  : "${AIOPS_DATA_FILESYSTEM_EVIDENCE_FILE:?set a machine-readable storage evidence output path}"
+  DATA_VOLUME_NAME="${PROJECT_NAME}_aiops_data"
+  DATA_VOLUME_MOUNTPOINT="$(docker volume inspect "$DATA_VOLUME_NAME" --format '{{.Mountpoint}}')"
+  ACTUAL_DATA_FILESYSTEM="$(sudo findmnt -no FSTYPE -T "$DATA_VOLUME_MOUNTPOINT")"
+  test "$ACTUAL_DATA_FILESYSTEM" = "$AIOPS_EXPECTED_DATA_FILESYSTEM"
+  docker run --rm --entrypoint python \
+    --volume "$DATA_VOLUME_NAME:/data:ro" \
+    "$AIOPS_BACKEND_IMAGE_REF" \
+    -c '
+import sqlite3
+import sys
+from pathlib import Path
+
+path = Path("/data/aiops.sqlite")
+if not path.is_file() or path.is_symlink():
+    raise SystemExit("SQLite database is missing or is a symlink")
+connection = sqlite3.connect("file:/data/aiops.sqlite?mode=ro", uri=True)
+try:
+    result = connection.execute("PRAGMA quick_check").fetchone()
+finally:
+    connection.close()
+if result != ("ok",):
+    raise SystemExit(f"SQLite quick_check failed: {result!r}")
+'
+  python3 - "$AIOPS_DATA_FILESYSTEM_EVIDENCE_FILE" "$DATA_VOLUME_NAME" \
+    "$DATA_VOLUME_MOUNTPOINT" "$ACTUAL_DATA_FILESYSTEM" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+output, volume_name, mountpoint, filesystem = sys.argv[1:]
+payload = {
+    "volume_name": volume_name,
+    "volume_mountpoint": mountpoint,
+    "filesystem": filesystem,
+    "sqlite_present": True,
+    "quick_check": "ok",
+}
+path = Path(output)
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+path.chmod(0o600)
+PY
+  echo "SQLite named volume verified on $ACTUAL_DATA_FILESYSTEM at $DATA_VOLUME_MOUNTPOINT"
+fi
 
 FRONTEND_ID="$("${COMPOSE_PROD[@]}" ps -q frontend)"
 BACKEND_ID="$("${COMPOSE_PROD[@]}" ps -q backend)"

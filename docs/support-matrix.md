@@ -17,13 +17,13 @@ Status vocabulary:
 
 | Area | Intended first-GA range | Evidence in this checkout / boundary | Status |
 | --- | --- | --- | --- |
-| OS | Ubuntu Server 22.04 LTS and 24.04 LTS, x86_64 | Clean KVM manifests passed on 22.04 (`5.15.0-185`) and 24.04 (`6.8.0-124`); the authoritative commit and source-archive hash live in `matrix-summary.json`. The images are diagnostic, not signed release artifacts. | EVIDENCE-ONLY |
-| Filesystem | local ext4 or xfs | Both clean-VM gates passed on local ext4. xfs has not run. SQLite on NFS/SMB is explicitly rejected. | EVIDENCE-ONLY |
+| OS | Ubuntu Server 22.04 LTS and 24.04 LTS, x86_64 | The clean-KVM gate requires both OS releases on both supported filesystems. Exact kernel, commit and source-archive hash are accepted only from generated `matrix-summary.json`. The images remain diagnostic, not signed release artifacts. | EVIDENCE-ONLY |
+| Filesystem | local ext4 or xfs | The gate requires four OS/filesystem combinations. For xfs it attaches a dedicated disk at `/var/lib/docker`; every run verifies the actual SQLite named volume filesystem. SQLite on NFS/SMB is explicitly rejected. | EVIDENCE-ONLY |
 | Init/firewall | systemd + UFW | Mutation remains disabled; no destructive-lab evidence. | TARGET |
-| Docker Engine | Candidate release lines 28.x and 29.x, exact patch captured per release test | The same OCI manifests passed on Engine 28.5.2/Ubuntu 22.04 and 29.6.1/Ubuntu 24.04. CI must repeat against the protected release digest before `SUPPORTED`. | EVIDENCE-ONLY |
-| Docker Compose | Compose plugin that supports the checked production schema, `config --format json`, health dependencies and secrets | Compose 5.3.1 passed on both clean VMs; older local Compose 2.31.0 also passed diagnostic topology. The release floor/ceiling is not a support promise until signed-release CI repeats it. | EVIDENCE-ONLY |
-| Platform frontend | Build input `node:22.23.1-bookworm-slim`; runtime input `nginx:1.28.3-alpine3.23` | The diagnostic OCI digest recorded in generated `matrix-summary.json` passed on both clean VMs. It is unsigned and cannot become a GA release. | EVIDENCE-ONLY |
-| Platform backend | Build input `python:3.12.13-slim-bookworm` | The diagnostic OCI digest recorded in generated `matrix-summary.json` passed on both clean VMs. The protected release must reproduce, scan and sign its own digest. | EVIDENCE-ONLY |
+| Docker Engine | Candidate release lines 28.x and 29.x, exact patch captured per release test | All four clean-VM runs must consume the same backend/frontend OCI manifests. CI must repeat against the protected release digest before `SUPPORTED`. | EVIDENCE-ONLY |
+| Docker Compose | Compose plugin that supports the checked production schema, `config --format json`, health dependencies and secrets | Every clean-VM run records the exact Compose patch version. The release floor/ceiling is not a support promise until signed-release CI repeats it. | EVIDENCE-ONLY |
+| Platform frontend | Build input `node:22.23.1-bookworm-slim`; runtime input `nginx:1.28.3-alpine3.23` | The diagnostic OCI digest recorded in generated `matrix-summary.json` must pass all four clean-VM combinations. It is unsigned and cannot become a GA release. | EVIDENCE-ONLY |
+| Platform backend | Build input `python:3.12.13-slim-bookworm` | The diagnostic OCI digest recorded in generated `matrix-summary.json` must pass all four clean-VM combinations. The protected release must reproduce, scan and sign its own digest. | EVIDENCE-ONLY |
 | Managed Nginx | Ubuntu distribution Nginx | Read-only diagnostics only; exact apt version is captured by the future clean-VM/R4C manifest. | TARGET |
 | ACME | HTTP-01 only | No live ACME evidence. DNS-01 is outside first GA. | TARGET |
 
@@ -62,10 +62,11 @@ hook exists at `scripts/test-production-browser.sh`; it intentionally bypasses
 the Vite `webServer` configuration and targets an already-running TLS topology.
 
 Clean-VM evidence is stored under
-`.omx/evidence/production-ga/GA-R0-001/agent-ops-r0-ubuntu{2204,2404}.json`.
+`.omx/evidence/production-ga/GA-R0-001/agent-ops-r0-ubuntu{2204,2404}-{ext4,xfs}.json`.
 Each manifest records the GPG-verified cloud-image fixture and SHA-256, exact
-OS/kernel, filesystem, Engine/Compose package versions, source archive, commit
-and both OCI digests. The lab uses
+OS/kernel, root and Docker-data filesystems, Docker root/storage driver,
+Engine/Compose package versions, source archive, commit and both OCI digests.
+The lab uses
 an ephemeral registry bound only to loopback and the libvirt bridge so Docker
 28 and 29 pull the same manifest rather than comparing unstable local config
 IDs. Passing diagnostic manifests do not replace GHCR, Trivy, SBOM, provenance
