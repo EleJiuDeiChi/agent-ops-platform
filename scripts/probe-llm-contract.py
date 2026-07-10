@@ -17,6 +17,11 @@ from urllib.parse import urlparse
 
 import httpx
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT_DIR / "backend"))
+
+from app.ai.provider_profiles import get_provider_profile  # noqa: E402
+
 
 RELEASE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 POLICY_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -31,16 +36,33 @@ class ProbeError(RuntimeError):
     pass
 
 
-def _secret_from_environment() -> str:
-    direct_names = ("AIOPS_LLM_API_KEY", "AIOPS_DEEPSEEK_API_KEY")
-    file_names = ("AIOPS_LLM_API_KEY_FILE", "AIOPS_DEEPSEEK_API_KEY_FILE")
-    direct_values = [(name, os.getenv(name)) for name in direct_names if os.getenv(name)]
-    file_values = [(name, os.getenv(name)) for name in file_names if os.getenv(name)]
+def _secret_from_environment(provider_id: str) -> str:
+    provider_by_name = {
+        "AIOPS_LLM_API_KEY": None,
+        "AIOPS_DEEPSEEK_API_KEY": "deepseek",
+        "AIOPS_MOONSHOT_API_KEY": "moonshot",
+        "AIOPS_ZHIPU_API_KEY": "zhipu",
+    }
+    direct_values = [
+        (name, owner, os.getenv(name))
+        for name, owner in provider_by_name.items()
+        if os.getenv(name)
+    ]
+    file_values = [
+        (f"{name}_FILE", owner, os.getenv(f"{name}_FILE"))
+        for name, owner in provider_by_name.items()
+        if os.getenv(f"{name}_FILE")
+    ]
     if len(direct_values) + len(file_values) != 1:
         raise ProbeError("configure exactly one supported LLM API key source")
     if direct_values:
-        return str(direct_values[0][1])
-    variable, raw_path = file_values[0]
+        variable, owner, value = direct_values[0]
+        if owner is not None and owner != provider_id:
+            raise ProbeError(f"{variable} does not match AIOPS_LLM_MODE")
+        return str(value)
+    variable, owner, raw_path = file_values[0]
+    if owner is not None and owner != provider_id:
+        raise ProbeError(f"{variable} does not match AIOPS_LLM_MODE")
     path = Path(str(raw_path))
     try:
         value = path.read_text(encoding="utf-8").rstrip("\r\n")
@@ -78,7 +100,12 @@ def _positive_decimal(value: Any, *, field: str, allow_zero: bool = False) -> De
     return parsed
 
 
-def _load_policy(path: Path, snapshot_path: Path) -> tuple[dict[str, Any], str]:
+def _load_policy(
+    path: Path,
+    snapshot_path: Path,
+    *,
+    provider_id: str,
+) -> tuple[dict[str, Any], str]:
     try:
         policy = json.loads(path.read_text(encoding="utf-8"))
         snapshot = snapshot_path.read_bytes()
@@ -87,6 +114,7 @@ def _load_policy(path: Path, snapshot_path: Path) -> tuple[dict[str, Any], str]:
     if not isinstance(policy, dict):
         raise ProbeError("policy file must contain a JSON object")
     required_strings = (
+        "provider_id",
         "account_identifier",
         "region",
         "retention",
@@ -101,6 +129,8 @@ def _load_policy(path: Path, snapshot_path: Path) -> tuple[dict[str, Any], str]:
     missing = [name for name in required_strings if not str(policy.get(name) or "").strip()]
     if missing:
         raise ProbeError(f"policy file is missing required fields: {', '.join(missing)}")
+    if policy["provider_id"] != provider_id:
+        raise ProbeError("policy provider_id does not match AIOPS_LLM_MODE")
     if policy.get("training_opt_out_confirmed") is not True:
         raise ProbeError("policy file must confirm training opt-out")
     if policy.get("redacted_operational_data_only") is not True:
@@ -276,25 +306,28 @@ def run_probe(
     output_path: Path,
     validity_hours: int,
 ) -> dict[str, Any]:
+    provider_id = _required_environment("AIOPS_LLM_MODE").lower()
+    try:
+        profile = get_provider_profile(provider_id)
+    except ValueError as exc:
+        raise ProbeError(str(exc)) from exc
     base_url = _required_environment("AIOPS_LLM_BASE_URL").rstrip("/")
     model = _required_environment("AIOPS_LLM_MODEL")
     release_digest = _required_environment("AIOPS_RELEASE_DIGEST").lower()
     runner_identity = _required_environment("AIOPS_EVIDENCE_RUNNER_IDENTITY")
     if not RELEASE_DIGEST_RE.fullmatch(release_digest):
         raise ProbeError("AIOPS_RELEASE_DIGEST must use sha256:<64 lowercase hex> format")
-    parsed = urlparse(base_url)
-    if (
-        parsed.scheme != "https"
-        or not parsed.netloc
-        or parsed.username
-        or parsed.password
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ProbeError("AIOPS_LLM_BASE_URL must be a credential-free HTTPS URL without query/fragment")
+    try:
+        profile.validate_base_url(base_url, production=True)
+    except ValueError as exc:
+        raise ProbeError(str(exc)) from exc
 
-    key = _secret_from_environment()
-    policy, policy_digest = _load_policy(policy_path, snapshot_path)
+    key = _secret_from_environment(provider_id)
+    policy, policy_digest = _load_policy(
+        policy_path,
+        snapshot_path,
+        provider_id=provider_id,
+    )
     connect_timeout = float(policy["connect_timeout_seconds"])
     read_timeout = float(policy["read_timeout_seconds"])
     max_retries = int(policy["max_retries"])
@@ -312,17 +345,19 @@ def run_probe(
 
     timeout = httpx.Timeout(connect=connect_timeout, read=read_timeout, write=read_timeout, pool=connect_timeout)
     with httpx.Client(headers=headers, timeout=timeout) as client:
-        models_response = _request_json(
-            client,
-            "GET",
-            f"{base_url}/models",
-            max_retries=max_retries,
-            attempts=attempts,
-            request_name="models",
-        )
-        model_ids = _model_ids(models_response.json())
-        if model not in model_ids:
-            raise ProbeError("configured model is not present in authenticated GET /models")
+        models_response: httpx.Response | None = None
+        if profile.models_path:
+            models_response = _request_json(
+                client,
+                "GET",
+                f"{base_url}{profile.models_path}",
+                max_retries=max_retries,
+                attempts=attempts,
+                request_name="model_discovery",
+            )
+            model_ids = _model_ids(models_response.json())
+            if model not in model_ids:
+                raise ProbeError("configured model is not present in authenticated model discovery")
 
         probe_value = "r0-live-contract-probe"
         tool_payload = {
@@ -350,7 +385,7 @@ def run_probe(
         tool_response = _request_json(
             client,
             "POST",
-            f"{base_url}/chat/completions",
+            f"{base_url}{profile.chat_path}",
             max_retries=max_retries,
             attempts=attempts,
             request_name="tool_call",
@@ -361,6 +396,13 @@ def run_probe(
             raise ProbeError("chat completion returned no choices")
         name, arguments = _validate_tool_call(choices[0].get("message"))
         input_tokens, output_tokens = _usage(tool_response)
+        discovery_content = (
+            models_response.content
+            if models_response is not None
+            else json.dumps(tool_response, sort_keys=True).encode("utf-8")
+        )
+        if models_response is None:
+            attempts["model_discovery"] = attempts["tool_call"]
 
         stream_payload = {
             "model": model,
@@ -371,7 +413,7 @@ def run_probe(
         stream_chunks = 0
         stream_done = False
         attempts["streaming"] = 1
-        with client.stream("POST", f"{base_url}/chat/completions", json=stream_payload) as response:
+        with client.stream("POST", f"{base_url}{profile.chat_path}", json=stream_payload) as response:
             if response.status_code >= 400:
                 raise ProbeError(f"streaming request failed with HTTP {response.status_code}")
             for line in response.iter_lines():
@@ -398,9 +440,9 @@ def run_probe(
         raise ProbeError("estimated live-probe cost exceeds approved cap")
 
     now = datetime.now(timezone.utc)
-    models_hash = hashlib.sha256(models_response.content).hexdigest()
+    discovery_hash = hashlib.sha256(discovery_content).hexdigest()
     required_checks = {
-        "models": True,
+        "model_discovery": True,
         "tool_call": True,
         "streaming": True,
         "invalid_tool_rejection": True,
@@ -411,19 +453,25 @@ def run_probe(
         "owner_approvals": True,
     }
     manifest = {
-        "schema_version": 1,
-        "test_id": "GA-R0-001-LLM",
+        "schema_version": 2,
+        "test_id": f"GA-R0-001-LLM-{provider_id}",
         "result": "pass",
         "executed_at": now.isoformat(),
         "expires_at": (now + timedelta(hours=validity_hours)).isoformat(),
         "runner_identity": runner_identity,
         "release_digest": release_digest,
         "evidence_path": str(output_path),
+        "provider_id": provider_id,
         "provider_origin": base_url,
         "model": model,
         "account_identifier": policy["account_identifier"],
         "region": policy["region"],
-        "models_response_sha256": f"sha256:{models_hash}",
+        "model_discovery": {
+            "method": profile.discovery_method,
+            "path": profile.models_path or profile.chat_path,
+            "model_confirmed": True,
+            "response_sha256": f"sha256:{discovery_hash}",
+        },
         "tool_call": {"name": name, "arguments": arguments, "schema_match": True},
         "invalid_tool_rejection": {
             "unknown_tool_rejected": True,

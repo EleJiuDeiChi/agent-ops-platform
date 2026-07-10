@@ -15,7 +15,7 @@ from app.config import Settings
 
 
 REQUIRED_CHECKS = (
-    "models",
+    "model_discovery",
     "tool_call",
     "streaming",
     "invalid_tool_rejection",
@@ -54,15 +54,27 @@ def _parse_expiry(raw: Any) -> datetime | None:
 
 def _manifest_contract_complete(evidence: dict[str, Any]) -> bool:
     required_strings = (
+        "provider_id",
         "runner_identity",
         "evidence_path",
         "account_identifier",
         "region",
-        "models_response_sha256",
     )
     if any(not isinstance(evidence.get(name), str) or not evidence[name].strip() for name in required_strings):
         return False
-    if not DIGEST_PATTERN.fullmatch(evidence["models_response_sha256"]):
+    discovery = evidence.get("model_discovery")
+    if not isinstance(discovery, dict):
+        return False
+    if discovery.get("method") not in {
+        "authenticated_models_endpoint",
+        "authenticated_chat_completion",
+    }:
+        return False
+    if discovery.get("model_confirmed") is not True:
+        return False
+    if not isinstance(discovery.get("path"), str) or not discovery["path"].startswith("/"):
+        return False
+    if not DIGEST_PATTERN.fullmatch(str(discovery.get("response_sha256") or "")):
         return False
 
     tool_call = evidence.get("tool_call")
@@ -173,7 +185,7 @@ def validate_provider_evidence(
         evidence = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError):
         return _unverified("llm_evidence_invalid")
-    if not isinstance(evidence, dict) or evidence.get("schema_version") != 1:
+    if not isinstance(evidence, dict) or evidence.get("schema_version") != 2:
         return _unverified("llm_evidence_schema_invalid")
     if evidence.get("result") != "pass":
         return _unverified("llm_evidence_result_not_pass")
@@ -181,6 +193,8 @@ def validate_provider_evidence(
         return _unverified("llm_evidence_contract_incomplete")
 
     expected_provider = (settings.llm_base_url or "").rstrip("/")
+    if evidence.get("provider_id") != settings.llm_mode:
+        return _unverified("llm_evidence_provider_id_mismatch")
     if evidence.get("provider_origin") != expected_provider:
         return _unverified("llm_evidence_provider_mismatch")
     if evidence.get("model") != settings.llm_model:

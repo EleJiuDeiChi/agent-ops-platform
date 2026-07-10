@@ -126,7 +126,7 @@ fi
 printf '%064d\n' 0 > "$TMP_DIR/session_secret"
 printf '%064d\n' 1 > "$TMP_DIR/llm_api_key"
 printf '%064d\n' 2 > "$TMP_DIR/setup_token"
-printf '%s\n' '{"schema_version":1,"result":"fail"}' > "$TMP_DIR/llm_evidence.json"
+printf '%s\n' '{"schema_version":2,"result":"fail"}' > "$TMP_DIR/llm_evidence.json"
 printf '%s\n' 'verification-only certificate placeholder' > "$TMP_DIR/tls_cert.pem"
 printf '%s\n' 'verification-only key placeholder' > "$TMP_DIR/tls_key.pem"
 
@@ -142,7 +142,7 @@ export AIOPS_TLS_CERT_FILE_HOST="$TMP_DIR/tls_cert.pem"
 export AIOPS_TLS_KEY_FILE_HOST="$TMP_DIR/tls_key.pem"
 export AIOPS_LLM_MODE=deepseek
 export AIOPS_LLM_BASE_URL=https://api.deepseek.com
-export AIOPS_LLM_MODEL=verification-model-from-models-endpoint
+export AIOPS_LLM_MODEL=deepseek-v4-flash
 export AIOPS_LLM_API_KEY_FILE_HOST="$TMP_DIR/llm_api_key"
 export AIOPS_LLM_EVIDENCE_FILE_HOST="$TMP_DIR/llm_evidence.json"
 export AIOPS_LLM_EVIDENCE_SHA256="sha256:$(openssl dgst -sha256 "$TMP_DIR/llm_evidence.json" | awk '{print $NF}')"

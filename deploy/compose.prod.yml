@@ -14,9 +14,9 @@ services:
       AIOPS_DEBUG_SKIP_PASSWORD_CHANGE: "0"
       AIOPS_RELEASE_DIGEST: ${AIOPS_RELEASE_DIGEST:?set the immutable backend image/release digest}
       AIOPS_COMMIT_SHA: ${AIOPS_COMMIT_SHA:?set the reviewed release commit SHA}
-      AIOPS_LLM_MODE: ${AIOPS_LLM_MODE:?set deepseek or openai_compatible after the R0 provider review}
+      AIOPS_LLM_MODE: ${AIOPS_LLM_MODE:?set deepseek, moonshot, zhipu, or openai_compatible after provider review}
       AIOPS_LLM_BASE_URL: ${AIOPS_LLM_BASE_URL:?set the probed HTTPS OpenAI-compatible base URL}
-      AIOPS_LLM_MODEL: ${AIOPS_LLM_MODEL:?set a model returned by GET /models}
+      AIOPS_LLM_MODEL: ${AIOPS_LLM_MODEL:?set the exact model proven by the provider-specific discovery contract}
       AIOPS_LLM_API_KEY_FILE: /run/secrets/llm_api_key
       AIOPS_LLM_EVIDENCE_FILE: /run/secrets/llm_evidence
       AIOPS_LLM_EVIDENCE_SHA256: ${AIOPS_LLM_EVIDENCE_SHA256:?set the exact digest printed by probe-llm-contract.py}

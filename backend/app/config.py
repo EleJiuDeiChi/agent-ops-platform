@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlparse
 
+from app.ai.provider_profiles import LIVE_PROVIDER_IDS, get_provider_profile
+
 
 class ConfigurationError(RuntimeError):
     """Raised when runtime configuration is unsafe or internally inconsistent."""
@@ -184,21 +186,19 @@ class Settings:
             raise ConfigurationError(
                 "AIOPS_SETUP_TOKEN_EXPIRES_AT requires AIOPS_SETUP_TOKEN or AIOPS_SETUP_TOKEN_FILE"
             )
-        if not self.llm_mode_configured or self.llm_mode not in {"deepseek", "openai_compatible"}:
+        if not self.llm_mode_configured or self.llm_mode not in LIVE_PROVIDER_IDS:
             raise ConfigurationError(
-                "production requires explicit AIOPS_LLM_MODE=deepseek or openai_compatible"
+                "production requires explicit AIOPS_LLM_MODE=deepseek, moonshot, zhipu, or openai_compatible"
             )
         if not self.llm_base_url_configured or not self.llm_base_url:
             raise ConfigurationError("production requires explicit AIOPS_LLM_BASE_URL")
-        parsed_llm_url = urlparse(self.llm_base_url)
-        if parsed_llm_url.scheme != "https" or not parsed_llm_url.hostname:
-            raise ConfigurationError("production LLM base URL must use HTTPS")
-        if parsed_llm_url.username is not None or parsed_llm_url.password is not None:
-            raise ConfigurationError("production LLM base URL must not contain userinfo")
-        if parsed_llm_url.params or parsed_llm_url.query or parsed_llm_url.fragment:
-            raise ConfigurationError(
-                "production LLM base URL must not contain params, query, or fragment"
+        try:
+            get_provider_profile(self.llm_mode).validate_base_url(
+                self.llm_base_url,
+                production=True,
             )
+        except ValueError as exc:
+            raise ConfigurationError(str(exc)) from exc
         if not self.llm_model_configured or not self.llm_model:
             raise ConfigurationError("production requires explicit AIOPS_LLM_MODEL")
         if not self.llm_api_key_configured or not self.llm_api_key:
@@ -236,6 +236,7 @@ def load_settings(
     except ValueError as exc:
         raise ConfigurationError("AIOPS_ENV must be dev, test, or prod") from exc
 
+    llm_mode = env.get("AIOPS_LLM_MODE", "mock").strip().lower() or "mock"
     session_secret, session_secret_configured = _secret_value(env, "AIOPS_SESSION_SECRET")
     if session_secret is None:
         session_secret = (
@@ -248,16 +249,26 @@ def load_settings(
         env, "AIOPS_BOOTSTRAP_ADMIN_PASSWORD"
     )
     setup_token, setup_token_configured = _secret_value(env, "AIOPS_SETUP_TOKEN")
-    llm_api_key, llm_api_key_configured = _secret_value(env, "AIOPS_LLM_API_KEY")
-    legacy_llm_api_key, legacy_llm_api_key_configured = _secret_value(
-        env, "AIOPS_DEEPSEEK_API_KEY"
-    )
-    if llm_api_key_configured and legacy_llm_api_key_configured:
-        raise ConfigurationError(
-            "configure only AIOPS_LLM_API_KEY or legacy AIOPS_DEEPSEEK_API_KEY, not both"
-        )
-    if not llm_api_key_configured and legacy_llm_api_key_configured:
-        llm_api_key = legacy_llm_api_key
+    key_sources = []
+    for variable, provider_id in (
+        ("AIOPS_LLM_API_KEY", None),
+        ("AIOPS_DEEPSEEK_API_KEY", "deepseek"),
+        ("AIOPS_MOONSHOT_API_KEY", "moonshot"),
+        ("AIOPS_ZHIPU_API_KEY", "zhipu"),
+    ):
+        value, configured = _secret_value(env, variable)
+        if configured:
+            key_sources.append((variable, provider_id, value))
+    if len(key_sources) > 1:
+        raise ConfigurationError("configure exactly one supported LLM API key source")
+    llm_api_key = None
+    llm_api_key_configured = False
+    if key_sources:
+        variable, provider_id, llm_api_key = key_sources[0]
+        if provider_id is not None and llm_mode != provider_id:
+            raise ConfigurationError(
+                f"{variable} can only be used with AIOPS_LLM_MODE={provider_id}"
+            )
         llm_api_key_configured = True
 
     trusted_origins_configured = "AIOPS_TRUSTED_ORIGINS" in env
@@ -321,7 +332,7 @@ def load_settings(
             env.get("AIOPS_SETUP_TOKEN_EXPIRES_AT"),
             name="AIOPS_SETUP_TOKEN_EXPIRES_AT",
         ),
-        llm_mode=env.get("AIOPS_LLM_MODE", "mock").strip().lower() or "mock",
+        llm_mode=llm_mode,
         llm_mode_configured="AIOPS_LLM_MODE" in env,
         llm_base_url=env.get("AIOPS_LLM_BASE_URL"),
         llm_base_url_configured="AIOPS_LLM_BASE_URL" in env,

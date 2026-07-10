@@ -910,14 +910,18 @@ from pathlib import Path
 patterns = (
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     re.compile(r"(?i)authorization:\s*bearer\s+[A-Za-z0-9._~+/=-]{8,}"),
-    re.compile(r"(?:AIOPS_)?(?:SESSION_SECRET|LLM_API_KEY|DEEPSEEK_API_KEY|SETUP_TOKEN)=[^\s]+"),
-    re.compile(r'(?i)"(?:token|deepseek[_-]?api[_-]?key|(?:llm[_-]?)?api[_-]?key|session[_-]?secret|setup[_-]?token|password)"\s*:\s*"(?!\*{3}|<redacted>)[^"\s]{8,}"'),
+    re.compile(r"(?:AIOPS_)?(?:SESSION_SECRET|LLM_API_KEY|DEEPSEEK_API_KEY|MOONSHOT_API_KEY|ZHIPU_API_KEY|SETUP_TOKEN)=[^\s]+"),
+    re.compile(r'(?i)"(?:token|(?:deepseek|moonshot|zhipu)[_-]?api[_-]?key|(?:llm[_-]?)?api[_-]?key|session[_-]?secret|setup[_-]?token|password)"\s*:\s*"(?!\*{3}|<redacted>)[^"\s]{8,}"'),
 )
 positive_fixtures = (
     'AIOPS_DEEPSEEK_API_KEY=fixture-secret-value',
     'DEEPSEEK_API_KEY=fixture-secret-value',
+    'AIOPS_MOONSHOT_API_KEY=fixture-secret-value',
+    'ZHIPU_API_KEY=fixture-secret-value',
     '{"token":"fixture-secret-value"}',
     '{"deepseek_api_key":"fixture-secret-value"}',
+    '{"moonshot_api_key":"fixture-secret-value"}',
+    '{"zhipu_api_key":"fixture-secret-value"}',
 )
 for fixture in positive_fixtures:
     if not any(pattern.search(fixture) for pattern in patterns):

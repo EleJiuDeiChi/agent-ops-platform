@@ -1,4 +1,5 @@
 {
+  "provider_id": "REPLACE_WITH_deepseek_moonshot_or_zhipu",
   "account_identifier": "REPLACE_WITH_NON_SECRET_ACCOUNT_ID",
   "region": "PRC",
   "retention": "REPLACE_WITH_REVIEWED_PROVIDER_POLICY",
@@ -7,7 +8,7 @@
   "ai_owner": "REPLACE_WITH_OWNER",
   "security_owner": "REPLACE_WITH_OWNER",
   "privacy_owner": "REPLACE_WITH_OWNER",
-  "provider_policy_url": "https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html",
+  "provider_policy_url": "REPLACE_WITH_EXACT_PROVIDER_POLICY_HTTPS_URL",
   "provider_policy_sha256": "sha256:REPLACE_WITH_64_HEX_CHARACTERS",
   "reviewed_at": "REPLACE_WITH_UTC_ISO8601",
   "owner_approvals": {

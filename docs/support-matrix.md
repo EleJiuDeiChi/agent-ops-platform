@@ -72,34 +72,55 @@ an ephemeral registry bound only to loopback and the libvirt bridge so Docker
 IDs. Passing diagnostic manifests do not replace GHCR, Trivy, SBOM, provenance
 or signature evidence.
 
-## Live LLM contract
+## Live multi-provider LLM contract
 
-The candidate is OpenAI-compatible DeepSeek. No provider/model is currently
-`SUPPORTED`. The operator must set an explicit model returned by authenticated
-`GET /models`; no legacy alias is frozen.
+The control plane now has one provider-neutral OpenAI-compatible adapter and a
+fail-closed registry. One provider is active per deployment; changing provider,
+account, origin, model or release digest invalidates the old evidence. Adapter
+support is not a production support claim: all three built-ins remain `TARGET`
+until their own live probe and governance review pass.
 
-| Field | Required contract |
-| --- | --- |
-| Owner | AI owner; security owner; legal/privacy owner |
-| Base URL | `https://api.deepseek.com` candidate, HTTPS required |
-| Discovery | authenticated `GET /models`; configured model ID must be present |
-| Completion | `POST /chat/completions`, streaming and non-streaming |
-| Tool use | function tool call with JSON-schema arguments; unknown tool/field rejected locally |
-| Region | PRC |
-| Retention | not contractually fixed; zero-retention must not be claimed |
-| Training/model improvement | account-level opt-out required and captured |
-| Data sent | redacted operational facts only; no secrets, PII, private keys, raw DB or unredacted logs |
-| Timeout/quota | record connect/read timeout, retry count, rate/concurrency limit, token ceiling and cost cap |
+| Provider ID | Candidate model | Frozen production origin | Model confirmation | Provider-specific notes | Status |
+| --- | --- | --- | --- | --- | --- |
+| `deepseek` | `deepseek-v4-flash` | `https://api.deepseek.com` | authenticated `GET /models` | Legacy `deepseek-chat` and `deepseek-reasoner` are ineligible because their announced retirement is 2026-07-24 15:59 UTC. Candidate rates are CNY 1 / 1M cache-miss input and CNY 2 / 1M output tokens. | TARGET |
+| `moonshot` | `kimi-k2.6` | `https://api.moonshot.ai/v1` | authenticated `GET /models` | K2.6 supports streaming, thinking and tool calls. Published rates are USD 0.16 / 1M cache-hit input, USD 0.95 / 1M cache-miss input and USD 4 / 1M output tokens. The public privacy policy describes Singapore storage and model-improvement processing, so acceptable enterprise terms or an approved account control are blocking. | TARGET |
+| `zhipu` | `glm-5.2` | `https://open.bigmodel.cn/api/paas/v4` | authenticated `POST /chat/completions` with the exact model | The official API surface documents chat, streaming and Function Call but no OpenAI-shaped model-list endpoint. The authenticated completion response is therefore the discovery evidence. Current price must be captured from the account-visible price page at probe time. | TARGET |
+| `openai_compatible` | operator-selected | operator-selected credential-free HTTPS origin | authenticated `GET /models` | Extension lane only. It requires the same policy, evidence and owner gates and cannot inherit evidence from a built-in provider. | TARGET |
 
-The live probe manifest must include timestamp, account/region, exact model and
-`/models` response hash, tool-call/invalid-tool/stream/timeout evidence,
-redaction capture, usage/cost, policy snapshot and owner approvals. Until it
-passes, readiness reports `llm_unverified` and release remains `NO-GO`.
+Every provider must independently prove:
 
-Official contract references:
-[model list](https://api-docs.deepseek.com/api/list-models),
-[chat completion](https://api-docs.deepseek.com/api/create-chat-completion), and
-[tool calls](https://api-docs.deepseek.com/guides/tool_calls).
+- AI, security and privacy owners, account identifier, processing region,
+  retention and training/model-improvement decision;
+- exact origin and model, provider-specific model confirmation, non-streaming
+  completion, SSE streaming, typed tool call and local unknown-tool/field rejection;
+- bounded timeout/retry, token usage, reviewed price, per-probe cost cap and
+  seeded-secret redaction capture;
+- an immutable provider-policy snapshot and a manifest bound to provider ID,
+  account, model, release digest and expiry.
+
+Only redacted operational facts may leave the control plane. Secrets, personal
+information, private keys, raw database content and unredacted logs are always
+forbidden. Missing, stale or mismatched evidence keeps readiness at
+`llm_unverified` and makes production diagnosis fail closed with HTTP 503.
+
+Official references reviewed on 2026-07-10:
+
+- DeepSeek: [model list](https://api-docs.deepseek.com/api/list-models),
+  [chat completion](https://api-docs.deepseek.com/api/create-chat-completion),
+  [tool calls](https://api-docs.deepseek.com/guides/tool_calls),
+  [pricing](https://api-docs.deepseek.com/zh-cn/quick_start/pricing) and
+  [change log](https://api-docs.deepseek.com/zh-cn/updates).
+- Moonshot Kimi: [API overview](https://platform.kimi.ai/docs/api/overview),
+  [model list](https://platform.kimi.ai/docs/api/list-models),
+  [K2.6 guide](https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart),
+  [pricing](https://platform.kimi.ai/docs/pricing/chat-k26) and
+  [privacy policy](https://platform.kimi.ai/docs/agreement/userprivacy).
+- Zhipu GLM: [model overview](https://docs.bigmodel.cn/cn/guide/start/model-overview),
+  [GLM-5.2](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.2),
+  [chat completion](https://docs.bigmodel.cn/api-reference/模型-api/对话补全),
+  [tool calling](https://docs.bigmodel.cn/cn/guide/capabilities/function-calling),
+  [user agreement](https://docs.bigmodel.cn/cn/terms/user-agreement) and
+  [privacy policy](https://docs.bigmodel.cn/cn/terms/privacy-policy).
 
 ## Explicitly unsupported in R0
 

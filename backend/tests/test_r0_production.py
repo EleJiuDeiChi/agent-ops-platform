@@ -64,6 +64,10 @@ def apply_environment(monkeypatch: pytest.MonkeyPatch, values: dict[str, str]) -
         "AIOPS_LLM_EVIDENCE_SHA256",
         "AIOPS_DEEPSEEK_API_KEY",
         "AIOPS_DEEPSEEK_API_KEY_FILE",
+        "AIOPS_MOONSHOT_API_KEY",
+        "AIOPS_MOONSHOT_API_KEY_FILE",
+        "AIOPS_ZHIPU_API_KEY",
+        "AIOPS_ZHIPU_API_KEY_FILE",
     }
     for name in managed_names:
         monkeypatch.delenv(name, raising=False)
@@ -83,21 +87,21 @@ def apply_environment(monkeypatch: pytest.MonkeyPatch, values: dict[str, str]) -
         (None, {"AIOPS_DEBUG_SKIP_PASSWORD_CHANGE": "1"}, "DEBUG_SKIP"),
         ("AIOPS_LLM_MODE", {}, "LLM_MODE"),
         ("AIOPS_LLM_BASE_URL", {}, "LLM_BASE_URL"),
-        (None, {"AIOPS_LLM_BASE_URL": "http://llm.example.test/v1"}, "must use HTTPS"),
+        (None, {"AIOPS_LLM_BASE_URL": "http://llm.example.test/v1"}, "credential-free HTTPS"),
         (
             None,
             {"AIOPS_LLM_BASE_URL": "https://user:password@llm.example.test/v1"},
-            "must not contain userinfo",
+            "credential-free HTTPS",
         ),
         (
             None,
             {"AIOPS_LLM_BASE_URL": "https://llm.example.test/v1?tenant=secret"},
-            "must not contain params, query, or fragment",
+            "credential-free HTTPS",
         ),
         (
             None,
             {"AIOPS_LLM_BASE_URL": "https://llm.example.test/v1#fragment"},
-            "must not contain params, query, or fragment",
+            "credential-free HTTPS",
         ),
         ("AIOPS_LLM_MODEL", {}, "LLM_MODEL"),
         ("AIOPS_LLM_API_KEY_FILE", {}, "LLM_API_KEY"),
@@ -115,6 +119,65 @@ def test_production_configuration_fails_closed(
         env.pop(remove)
     env.update(override)
     with pytest.raises(ConfigurationError, match=message):
+        load_settings(env, validate=True, current_time=now)
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "base_url", "candidate_model"),
+    [
+        ("deepseek", "https://api.deepseek.com", "deepseek-v4-flash"),
+        ("moonshot", "https://api.moonshot.ai/v1", "kimi-k2.6"),
+        ("zhipu", "https://open.bigmodel.cn/api/paas/v4", "glm-5.2"),
+    ],
+)
+def test_production_accepts_each_built_in_provider_contract(
+    tmp_path: Path,
+    provider_id: str,
+    base_url: str,
+    candidate_model: str,
+) -> None:
+    now = datetime.now(UTC)
+    env = production_environment(tmp_path, now)
+    env.update(
+        {
+            "AIOPS_LLM_MODE": provider_id,
+            "AIOPS_LLM_BASE_URL": base_url,
+            "AIOPS_LLM_MODEL": candidate_model,
+        }
+    )
+    settings = load_settings(env, validate=True, current_time=now)
+    assert settings.llm_mode == provider_id
+    assert settings.llm_base_url == base_url
+    assert settings.llm_model == candidate_model
+
+
+def test_production_rejects_provider_identity_and_origin_mismatch(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    env = production_environment(tmp_path, now)
+    env.update(
+        {
+            "AIOPS_LLM_MODE": "moonshot",
+            "AIOPS_LLM_BASE_URL": "https://api.deepseek.com",
+            "AIOPS_LLM_MODEL": "kimi-k2.6",
+        }
+    )
+    with pytest.raises(ConfigurationError, match="Moonshot Kimi production base URL"):
+        load_settings(env, validate=True, current_time=now)
+
+
+def test_provider_specific_key_alias_must_match_selected_provider(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    env = production_environment(tmp_path, now)
+    env.pop("AIOPS_LLM_API_KEY_FILE")
+    env.update(
+        {
+            "AIOPS_LLM_MODE": "zhipu",
+            "AIOPS_LLM_BASE_URL": "https://open.bigmodel.cn/api/paas/v4",
+            "AIOPS_LLM_MODEL": "glm-5.2",
+            "AIOPS_MOONSHOT_API_KEY": "wrong-provider-key",
+        }
+    )
+    with pytest.raises(ConfigurationError, match="only be used with AIOPS_LLM_MODE=moonshot"):
         load_settings(env, validate=True, current_time=now)
 
 
@@ -369,13 +432,13 @@ def test_provider_uses_canonical_key_file_and_explicit_model(
     env = production_environment(tmp_path, now)
     apply_environment(monkeypatch, env)
 
-    from app.ai.providers import DeepSeekChatProvider, deepseek_enabled, model_name
+    from app.ai.providers import OpenAICompatibleChatProvider, llm_enabled, model_name
 
-    provider = DeepSeekChatProvider()
+    provider = OpenAICompatibleChatProvider()
     assert provider.api_key == "k" * 48
     assert provider.base_url == "https://llm.example.test/v1"
     assert provider.model == "frozen-production-model"
-    assert deepseek_enabled() is True
+    assert llm_enabled() is True
     assert model_name() == "frozen-production-model"
 
 
@@ -388,11 +451,11 @@ def test_test_environment_keeps_mock_provider_default(
         {"AIOPS_ENV": "test", "AIOPS_DB_PATH": str(tmp_path / "test.sqlite")},
     )
 
-    from app.ai.providers import deepseek_enabled, llm_mode, model_name
+    from app.ai.providers import llm_enabled, llm_mode, model_name
 
     assert llm_mode() == "mock"
     assert model_name() == "mock"
-    assert deepseek_enabled() is False
+    assert llm_enabled() is False
 
 
 def test_version_reports_declared_release_identity_without_authentication(
@@ -440,9 +503,10 @@ def provider_evidence_environment(
     env = production_environment(tmp_path, now)
     release_digest = "sha256:" + "a" * 64
     evidence = {
-        "schema_version": 1,
+        "schema_version": 2,
         "result": "pass",
         "executed_at": now.isoformat(),
+        "provider_id": env["AIOPS_LLM_MODE"],
         "provider_origin": env["AIOPS_LLM_BASE_URL"],
         "model": env["AIOPS_LLM_MODEL"],
         "release_digest": release_digest,
@@ -451,7 +515,12 @@ def provider_evidence_environment(
         "evidence_path": "test-evidence/llm-evidence.json",
         "account_identifier": "test-account",
         "region": "PRC",
-        "models_response_sha256": "sha256:" + "c" * 64,
+        "model_discovery": {
+            "method": "authenticated_models_endpoint",
+            "path": "/models",
+            "model_confirmed": True,
+            "response_sha256": "sha256:" + "c" * 64,
+        },
         "tool_call": {
             "name": "probe_echo",
             "arguments": {"value": "r0-live-contract-probe"},
@@ -466,7 +535,7 @@ def provider_evidence_environment(
             "connect_timeout_seconds": 10,
             "read_timeout_seconds": 60,
             "max_retries": 1,
-            "attempts": {"models": 1, "tool_call": 1, "streaming": 1},
+            "attempts": {"model_discovery": 1, "tool_call": 1, "streaming": 1},
         },
         "redaction_capture": {
             "seeded_secret_absent": True,
@@ -513,6 +582,7 @@ def provider_evidence_environment(
 @pytest.mark.parametrize(
     ("overrides", "reason_code"),
     [
+        ({"provider_id": "deepseek"}, "llm_evidence_provider_id_mismatch"),
         ({"provider_origin": "https://different.example.test/v1"}, "llm_evidence_provider_mismatch"),
         ({"model": "different-model"}, "llm_evidence_model_mismatch"),
         ({"release_digest": "sha256:" + "b" * 64}, "llm_evidence_release_mismatch"),
@@ -578,7 +648,7 @@ def test_verified_provider_evidence_unlocks_readiness_and_diagnosis(
     importlib.reload(main)
     monkeypatch.setattr(
         main,
-        "run_deepseek_diagnosis",
+        "run_llm_diagnosis",
         lambda actor_id, session_id, question: {
             "status": "verified-provider-used",
             "question": question,

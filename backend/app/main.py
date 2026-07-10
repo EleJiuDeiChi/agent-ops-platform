@@ -15,9 +15,9 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from app.ai.agent_orchestrator import run_deepseek_diagnosis
+from app.ai.agent_orchestrator import run_llm_diagnosis
 from app.ai.mock_orchestrator import run_mock_diagnosis
-from app.ai.providers import deepseek_enabled, model_name
+from app.ai.providers import llm_enabled, model_name
 from app.ai.verification import validate_provider_evidence
 from app.auth.security import (
     clear_session_cookie,
@@ -1180,8 +1180,8 @@ def create_diagnosis(
                 "verification_reason_code": verification.reason_code,
             },
         )
-    if deepseek_enabled():
-        return run_deepseek_diagnosis(identity.actor_id, identity.session_id, payload.question)
+    if llm_enabled():
+        return run_llm_diagnosis(identity.actor_id, identity.session_id, payload.question)
     return run_mock_diagnosis(identity.actor_id, identity.session_id, payload.question)
 
 

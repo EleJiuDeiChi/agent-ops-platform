@@ -43,14 +43,15 @@ mutations.
 | DB/host loss | none sufficient at R0 | off-host encrypted restore is NO-GO |
 | Compromised management proxy | TLS secrets isolated to frontend; backend unexposed | signed release and external monitoring pending |
 
-## DeepSeek/OpenAI-compatible data boundary
+## Multi-provider LLM data boundary
 
-The current DeepSeek candidate stores personal-information service data in the
-PRC; retention is not contractually fixed, and model-improvement opt-out is
-required. Never send secrets, personal information, private keys, raw database
-content or unredacted server logs. Security and legal owners must approve the
-captured request/response probe and policy record before live mode is enabled.
-No R0 document claims zero retention.
+DeepSeek, Moonshot Kimi and Zhipu GLM are separate data processors and never
+share governance evidence. Each selected provider must have its own reviewed
+policy snapshot, account/region record, retention and training-use decision,
+owner approvals, cost cap and live contract probe. Never send secrets, personal
+information, private keys, raw database content or unredacted server logs.
+Security and privacy owners must approve the selected provider before live mode
+is enabled. No R0 document claims zero retention for any provider.
 
 ## Non-waivable NO-GO conditions
 

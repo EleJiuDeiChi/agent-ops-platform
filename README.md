@@ -25,22 +25,31 @@
 
 - 后端：Python 3.12、FastAPI、Pydantic、SQLite、pytest
 - 前端：React、TypeScript、Vite
-- AI：默认 mock/fixture 模式；设置 `AIOPS_LLM_MODE=deepseek` 后可通过 DeepSeek OpenAI-compatible API 接入真实模型
+- AI：默认 mock/fixture 模式；真实模式通过统一 OpenAI-compatible 适配层支持 DeepSeek、月之暗面 Kimi、智谱 GLM 和自定义兼容服务
 
-### DeepSeek 真实模型配置
+### 真实模型配置
 
-不要把 API Key 写进仓库或前端。只在后端运行环境设置：
+不要把 API Key 写进仓库或前端。每个部署只选择一个活动模型供应商，
+并且必须使用该供应商独立的上线证据。内置候选如下：
+
+| `AIOPS_LLM_MODE` | Base URL | 首个候选模型 |
+| --- | --- | --- |
+| `deepseek` | `https://api.deepseek.com` | `deepseek-v4-flash` |
+| `moonshot` | `https://api.moonshot.ai/v1` | `kimi-k2.6` |
+| `zhipu` | `https://open.bigmodel.cn/api/paas/v4` | `glm-5.2` |
+
+只在后端运行环境设置，例如：
 
 ```bash
 export AIOPS_LLM_MODE=deepseek
-export AIOPS_LLM_API_KEY_FILE="/仅后端可读的路径/deepseek_api_key"
+export AIOPS_LLM_API_KEY_FILE="/仅后端可读的路径/llm_api_key"
 export AIOPS_LLM_BASE_URL="https://api.deepseek.com"
-export AIOPS_LLM_MODEL="从认证后的 GET /models 返回值中选择"
-export AIOPS_DEEPSEEK_THINKING="enabled"
+export AIOPS_LLM_MODEL="deepseek-v4-flash"
+export AIOPS_LLM_THINKING="enabled"
 ```
 
 本仓库正式生产 Compose 只通过 secret file 注入 Key；直接设置
-`AIOPS_LLM_API_KEY` / `AIOPS_DEEPSEEK_API_KEY` 仅用于本地开发或由外部
+`AIOPS_LLM_API_KEY` 及厂商兼容别名仅用于本地开发或由外部
 secret manager 提供的受控运行环境，并且不得写入 `.env`、Compose、日志
 或 shell history。
 
@@ -106,7 +115,7 @@ mutating/destructive placeholder capability 必须保持 disabled；当前部署
 不得声称能真实修改宿主机。以下证据完成前禁止公网正式投产：
 
 - 受保护 release 的 GHCR digest、SBOM、签名、provenance 和容器扫描；
-- DeepSeek/OpenAI-compatible `/models`、tool-calling、脱敏与数据条款 live probe；
+- 所选模型供应商独立的模型确认、tool-calling、脱敏与数据条款 live probe；
 - 版本化迁移、异地备份恢复、可观测性、升级/回滚和完整 CI/CD；
 - R1-R7 的 Agent、任务、安全、领域能力、UI、试点和 soak/canary gate。
 

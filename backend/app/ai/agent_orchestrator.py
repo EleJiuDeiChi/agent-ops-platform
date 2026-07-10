@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import Any
 
-from app.ai.providers import DeepSeekChatProvider, LLMProviderError, model_name
+from app.ai.providers import OpenAICompatibleChatProvider, LLMProviderError, model_name
 from app.models.schemas import RiskLevel, Tool, ToolResult
 from app.storage import db
 from app.tools.registry import get_tool, invoke_tool, list_tools
@@ -37,7 +37,7 @@ def _json_schema_for(tool: Tool) -> dict[str, Any]:
     }
 
 
-def _deepseek_tools() -> list[dict[str, Any]]:
+def _provider_tools() -> list[dict[str, Any]]:
     return [
         {
             "type": "function",
@@ -133,10 +133,10 @@ def _approval_for(
 def _assistant_message(response: dict[str, Any]) -> dict[str, Any]:
     choices = response.get("choices") or []
     if not choices:
-        raise LLMProviderError("DeepSeek response did not include choices")
+        raise LLMProviderError("LLM response did not include choices")
     message = choices[0].get("message") or {}
     if not isinstance(message, dict):
-        raise LLMProviderError("DeepSeek response message is invalid")
+        raise LLMProviderError("LLM response message is invalid")
     return message
 
 
@@ -195,7 +195,7 @@ def _is_json_object(content: str) -> bool:
 
 
 def _structured_final_content(
-    provider: DeepSeekChatProvider,
+    provider: OpenAICompatibleChatProvider,
     messages: list[dict[str, Any]],
     fallback_content: str,
 ) -> str:
@@ -232,11 +232,11 @@ def _error_payload(exc: Exception) -> dict[str, Any]:
     }
 
 
-def run_deepseek_diagnosis(actor_id: str, auth_session_id: str, question: str) -> dict:
+def run_llm_diagnosis(actor_id: str, auth_session_id: str, question: str) -> dict:
     session = db.create_diagnosis(actor_id, question)
     session_id = session["id"]
     sequence = 1
-    provider = DeepSeekChatProvider()
+    provider = OpenAICompatibleChatProvider()
     evidence_refs: list[str] = []
 
     db.add_event(
@@ -258,7 +258,7 @@ def run_deepseek_diagnosis(actor_id: str, auth_session_id: str, question: str) -
         {"role": "system", "content": _system_prompt()},
         {"role": "user", "content": question},
     ]
-    tools = _deepseek_tools()
+    tools = _provider_tools()
     max_turns = int(os.getenv("AIOPS_AGENT_MAX_TURNS", "6"))
 
     try:
@@ -370,3 +370,8 @@ def run_deepseek_diagnosis(actor_id: str, auth_session_id: str, question: str) -
         session["status"] = "error"
         session["updated_at"] = datetime.now(UTC).isoformat()
         return session
+
+
+def run_deepseek_diagnosis(actor_id: str, auth_session_id: str, question: str) -> dict:
+    """Backward-compatible entrypoint for callers deployed before multi-provider support."""
+    return run_llm_diagnosis(actor_id, auth_session_id, question)

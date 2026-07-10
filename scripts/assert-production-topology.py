@@ -203,6 +203,9 @@ def assert_runtime(
         env_names = {item.split("=", 1)[0] for item in config.get("Env") or []}
         require("AIOPS_SESSION_SECRET" not in env_names, "direct session secret leaked into environment")
         require("AIOPS_LLM_API_KEY" not in env_names, "direct LLM secret leaked into environment")
+        require("AIOPS_DEEPSEEK_API_KEY" not in env_names, "direct DeepSeek secret leaked into environment")
+        require("AIOPS_MOONSHOT_API_KEY" not in env_names, "direct Moonshot secret leaked into environment")
+        require("AIOPS_ZHIPU_API_KEY" not in env_names, "direct Zhipu secret leaked into environment")
         require(
             "AIOPS_BOOTSTRAP_ADMIN_PASSWORD" not in env_names,
             "bootstrap password leaked into production environment",

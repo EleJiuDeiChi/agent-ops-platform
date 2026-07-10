@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-07-10T06:35:58.699Z",
-  "updatedAt": "2026-07-10T14:30:16.000Z",
+  "updatedAt": "2026-07-10T16:18:05.635Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -81,8 +81,18 @@
       "attempt": 0,
       "createdAt": "2026-07-10T06:35:58.699Z",
       "updatedAt": "2026-07-10T06:35:58.699Z"
+    },
+    {
+      "id": "G009-r0-multi-provider-llm-contract",
+      "title": "R0 Multi-provider LLM Contract",
+      "objective": "在进入 R1 前完成 provider-neutral OpenAI-compatible 适配层与生产支持矩阵，首批覆盖 DeepSeek、月之暗面 Moonshot/Kimi、智谱 GLM；每个提供商独立声明 base URL、模型发现、stream/tool-call/usage 契约、密钥文件、数据区域/留存/训练使用、价格配额、live probe 证据和 feature flag。业务层不得硬编码单一提供商，未完成独立 live gate 的 provider 必须 fail-closed。",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-10T16:18:05.635Z",
+      "updatedAt": "2026-07-10T16:18:05.635Z",
+      "evidence": "User explicitly requires support for 月之暗面、智谱等模型 in addition to DeepSeek on 2026-07-10."
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",
-    "activeGoalId": "G001-r0-production-baseline"
+  "activeGoalId": "G001-r0-production-baseline"
 }

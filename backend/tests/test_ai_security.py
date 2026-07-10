@@ -10,7 +10,7 @@ def test_provider_payload_redacts_configured_secrets_and_common_pii(
 ) -> None:
     monkeypatch.setenv("AIOPS_ENV", "test")
     monkeypatch.setenv("AIOPS_SESSION_SECRET", "session-secret-for-redaction")
-    monkeypatch.setenv("AIOPS_LLM_MODE", "deepseek")
+    monkeypatch.setenv("AIOPS_LLM_MODE", "openai_compatible")
     monkeypatch.setenv("AIOPS_LLM_BASE_URL", "https://llm.example.test/v1")
     monkeypatch.setenv("AIOPS_LLM_MODEL", "capture-model")
     monkeypatch.setenv("AIOPS_LLM_API_KEY", "provider-api-key-secret")
@@ -32,7 +32,7 @@ def test_provider_payload_redacts_configured_secrets_and_common_pii(
         return Response()
 
     monkeypatch.setattr("app.ai.providers.httpx.post", fake_post)
-    from app.ai.providers import DeepSeekChatProvider
+    from app.ai.providers import OpenAICompatibleChatProvider
 
     messages = [
         {
@@ -55,7 +55,7 @@ def test_provider_payload_redacts_configured_secrets_and_common_pii(
             ),
         },
     ]
-    DeepSeekChatProvider().chat_completion(messages)
+    OpenAICompatibleChatProvider().chat_completion(messages)
 
     serialized = json.dumps(captured["json"], ensure_ascii=False)
     for forbidden in (
@@ -78,7 +78,7 @@ def test_provider_payload_redacts_configured_secrets_and_common_pii(
 
 def test_provider_error_body_is_redacted_before_it_can_reach_events(monkeypatch) -> None:
     monkeypatch.setenv("AIOPS_ENV", "test")
-    monkeypatch.setenv("AIOPS_LLM_MODE", "deepseek")
+    monkeypatch.setenv("AIOPS_LLM_MODE", "openai_compatible")
     monkeypatch.setenv("AIOPS_LLM_BASE_URL", "https://llm.example.test/v1")
     monkeypatch.setenv("AIOPS_LLM_MODEL", "capture-model")
     monkeypatch.setenv("AIOPS_LLM_API_KEY", "provider-api-key-secret")
@@ -92,11 +92,56 @@ def test_provider_error_body_is_redacted_before_it_can_reach_events(monkeypatch)
         )
 
     monkeypatch.setattr("app.ai.providers.httpx.post", lambda *args, **kwargs: Response())
-    from app.ai.providers import DeepSeekChatProvider, LLMProviderError
+    from app.ai.providers import OpenAICompatibleChatProvider, LLMProviderError
 
     with pytest.raises(LLMProviderError) as captured:
-        DeepSeekChatProvider().chat_completion([{"role": "user", "content": "safe"}])
+        OpenAICompatibleChatProvider().chat_completion([{"role": "user", "content": "safe"}])
     message = str(captured.value)
     assert "supersecret" not in message
     assert "dXNlcjpwYXNzd29yZA==" not in message
     assert "[REDACTED_SECRET]" in message
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "base_url", "expected_reasoning"),
+    [
+        ("deepseek", "https://api.deepseek.com", True),
+        ("moonshot", "https://api.moonshot.ai/v1", False),
+        ("zhipu", "https://open.bigmodel.cn/api/paas/v4", True),
+    ],
+)
+def test_built_in_provider_payload_adapts_reasoning_fields(
+    monkeypatch,
+    provider_id: str,
+    base_url: str,
+    expected_reasoning: bool,
+) -> None:
+    monkeypatch.setenv("AIOPS_ENV", "test")
+    monkeypatch.setenv("AIOPS_LLM_MODE", provider_id)
+    monkeypatch.setenv("AIOPS_LLM_BASE_URL", base_url)
+    monkeypatch.setenv("AIOPS_LLM_MODEL", "provider-model")
+    monkeypatch.setenv("AIOPS_LLM_API_KEY", "provider-api-key-secret")
+    monkeypatch.setenv("AIOPS_LLM_RETRIES", "0")
+    captured: dict = {}
+
+    class Response:
+        status_code = 200
+        text = "ok"
+
+        @staticmethod
+        def json() -> dict:
+            return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["json"] = kwargs["json"]
+        return Response()
+
+    monkeypatch.setattr("app.ai.providers.httpx.post", fake_post)
+    from app.ai.providers import OpenAICompatibleChatProvider
+
+    OpenAICompatibleChatProvider().chat_completion([{"role": "user", "content": "safe"}])
+
+    assert captured["url"] == f"{base_url}/chat/completions"
+    assert captured["json"]["thinking"] == {"type": "enabled"}
+    assert ("reasoning_effort" in captured["json"]) is expected_reasoning

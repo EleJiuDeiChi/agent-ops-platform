@@ -38,17 +38,19 @@ other ownership or mode:
 
 ```bash
 sudo chown 10001:10001 deploy/secrets/session_secret \
-  deploy/secrets/deepseek_api_key deploy/secrets/llm-contract.json \
+  deploy/secrets/llm_api_key deploy/secrets/llm-contract.json \
   deploy/secrets/setup_token
 sudo chmod 0400 deploy/secrets/session_secret \
-  deploy/secrets/deepseek_api_key deploy/secrets/llm-contract.json \
+  deploy/secrets/llm_api_key deploy/secrets/llm-contract.json \
   deploy/secrets/setup_token
 sudo chown 101:101 deploy/secrets/tls_cert.pem deploy/secrets/tls_key.pem
 sudo chmod 0400 deploy/secrets/tls_cert.pem deploy/secrets/tls_key.pem
 ```
 
-Before using a live LLM, complete the probe manifest in
-`docs/support-matrix.md`. A successful HTTP request alone is insufficient.
+Before using a live LLM, select one active provider (`deepseek`, `moonshot`, or
+`zhipu`) and complete that provider's probe manifest in
+`docs/support-matrix.md`. Evidence is not transferable between providers or
+accounts. A successful HTTP request alone is insufficient.
 
 Copy `docs/security/llm-provider-policy.example.json` to a protected working
 file, replace every placeholder, save the exact reviewed provider-policy page
@@ -65,7 +67,7 @@ then run:
 ```
 
 The probe verifies the live policy URL still hashes to the reviewed snapshot,
-authenticated model discovery, exact model, typed tool calling, streaming,
+provider-specific authenticated model discovery, exact model, typed tool calling, streaming,
 bounded timeout/retry, invalid-tool rejection, seeded-secret redaction and
 usage/cost limits. It writes the manifest read-only and prints the exact
 `AIOPS_LLM_EVIDENCE_SHA256` value. Copy the manifest to the protected host path
