@@ -62,6 +62,7 @@ trap cleanup EXIT
 openssl rand -hex 32 > "$AIOPS_SESSION_SECRET_FILE_HOST"
 openssl rand -hex 32 > "$AIOPS_LLM_API_KEY_FILE_HOST"
 openssl rand -hex 32 > "$AIOPS_SETUP_TOKEN_FILE_HOST"
+SETUP_TOKEN_VALUE="$(tr -d '\r\n' < "$AIOPS_SETUP_TOKEN_FILE_HOST")"
 chmod 600 "$AIOPS_SESSION_SECRET_FILE_HOST" "$AIOPS_LLM_API_KEY_FILE_HOST" "$AIOPS_SETUP_TOKEN_FILE_HOST"
 printf '%s\n' '{"schema_version":1,"result":"fail","reason":"live provider probe intentionally absent in topology test"}' > "$AIOPS_LLM_EVIDENCE_FILE_HOST"
 chmod 444 "$AIOPS_LLM_EVIDENCE_FILE_HOST"
@@ -121,8 +122,7 @@ assert_readiness "setup_required,llm_unverified"
 COOKIE_FILE="$TMP_DIR/cookies"
 CSRF_JSON="$(curl -kfsS -c "$COOKIE_FILE" "https://127.0.0.1:$HTTPS_PORT/api/csrf")"
 CSRF_TOKEN="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["csrf_token"])' <<<"$CSRF_JSON")"
-SETUP_TOKEN="$(tr -d '\r\n' < "$AIOPS_SETUP_TOKEN_FILE_HOST")"
-SETUP_BODY="$(printf '{"token":"%s","username":"admin","password":"ProductionTestPassword123!"}' "$SETUP_TOKEN")"
+SETUP_BODY="$(printf '{"token":"%s","username":"admin","password":"ProductionTestPassword123!"}' "$SETUP_TOKEN_VALUE")"
 curl -kfsS -b "$COOKIE_FILE" \
   -H "X-CSRF-Token: $CSRF_TOKEN" \
   -H "Origin: https://127.0.0.1:$HTTPS_PORT" \
