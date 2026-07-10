@@ -46,7 +46,7 @@ done
 "$ROOT_DIR/scripts/assert-production-topology.py" --help >/dev/null
 
 for marker in "ubuntu-cloudimage-keyring" "source_archive_sha256" \
-  "docker_ce_package" "registry@sha256:"; do
+  "docker_ce_package" "registry@sha256:" "cleanup_success_artifacts"; do
   grep -q "$marker" "$ROOT_DIR/scripts/test-r0-clean-vm-matrix.sh" || {
     echo "clean-VM evidence marker is missing: $marker" >&2
     exit 1

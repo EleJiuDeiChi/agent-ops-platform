@@ -188,6 +188,20 @@ cleanup_registry() {
   return 1
 }
 
+cleanup_success_artifacts() {
+  local image
+  for image in "$HOST_BACKEND_IMAGE" "$HOST_FRONTEND_IMAGE" "$HOST_TEST_IMAGE"; do
+    [ -n "$image" ] || continue
+    docker image rm "$image" >/dev/null 2>&1 || true
+    ! docker image inspect "$image" >/dev/null 2>&1 || \
+      fail "successful run left diagnostic image tag $image"
+  done
+  if [ "$KEEP_VMS" = "0" ]; then
+    rm -rf "$RUN_DIR"
+    [ ! -e "$RUN_DIR" ] || fail "successful run directory was not removed"
+  fi
+}
+
 push_release_images() {
   local backend_ref="$HOST_REGISTRY/agent-ops-backend:$REGISTRY_TAG"
   local frontend_ref="$HOST_REGISTRY/agent-ops-frontend:$REGISTRY_TAG"
@@ -756,6 +770,7 @@ main() {
   generate_matrix_summary
   cleanup_registry || fail "ephemeral registry or listening port was not removed"
   REGISTRY_STARTED=0
+  cleanup_success_artifacts
   echo "R0 clean-VM matrix passed"
 }
 
