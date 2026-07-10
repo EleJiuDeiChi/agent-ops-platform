@@ -41,7 +41,7 @@ export AIOPS_LLM_MODEL=contract-probe-pending
 export AIOPS_LLM_API_KEY_FILE_HOST="$TMP_DIR/llm_api_key"
 export AIOPS_LLM_EVIDENCE_FILE_HOST="$TMP_DIR/llm_evidence.json"
 export AIOPS_SETUP_TOKEN_FILE_HOST="$TMP_DIR/setup_token"
-export AIOPS_SETUP_TOKEN_EXPIRES_AT="$(python3 -c 'from datetime import UTC, datetime, timedelta; print((datetime.now(UTC) + timedelta(minutes=15)).isoformat())')"
+export AIOPS_SETUP_TOKEN_EXPIRES_AT="$(python3 -c 'from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat())')"
 
 COMPOSE_PROD=(docker compose -p "$PROJECT_NAME" -f "$ROOT_DIR/deploy/compose.prod.yml")
 COMPOSE_SETUP=(docker compose -p "$PROJECT_NAME" -f "$ROOT_DIR/deploy/compose.prod.yml" -f "$ROOT_DIR/deploy/compose.setup.yml")

@@ -1,0 +1,23 @@
+FROM python:3.12.13-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/workspace/backend
+
+RUN groupadd --gid 10001 aiops \
+    && useradd --uid 10001 --gid 10001 --create-home --home-dir /home/aiops --shell /usr/sbin/nologin aiops
+
+WORKDIR /workspace
+
+COPY backend/requirements.txt backend/requirements-dev.txt /tmp/requirements/
+RUN python -m pip install --no-cache-dir --disable-pip-version-check \
+      -r /tmp/requirements/requirements-dev.txt \
+    && rm -rf /tmp/requirements
+
+COPY --chown=aiops:aiops backend/app /workspace/backend/app
+COPY --chown=aiops:aiops backend/tests /workspace/backend/tests
+RUN mkdir -p /workspace/data && chown aiops:aiops /workspace/data
+
+USER 10001:10001
+
+CMD ["pytest", "-q", "-p", "no:cacheprovider", "backend/tests"]

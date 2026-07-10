@@ -10,6 +10,7 @@ test -x "$PYTHON_BIN" || PYTHON_BIN=python3
 required_files=(
   .dockerignore
   .env.production.example
+  backend/Dockerfile.test
   deploy/compose.prod.yml
   deploy/compose.setup.yml
   deploy/nginx.conf
@@ -27,6 +28,7 @@ required_files=(
   scripts/deploy-production.sh
   scripts/assert-production-topology.py
   scripts/test-production-compose.sh
+  scripts/test-r0-clean-vm-matrix.sh
 )
 
 for file in "${required_files[@]}"; do
@@ -55,6 +57,7 @@ if grep -Eq 'uses: [^#[:space:]]+@v[0-9]' "$ROOT_DIR/.github/workflows/r0-ci.yml
 fi
 
 grep -q '^USER 10001:10001$' "$ROOT_DIR/backend/Dockerfile"
+grep -q '^USER 10001:10001$' "$ROOT_DIR/backend/Dockerfile.test"
 grep -q '^USER 101:101$' "$ROOT_DIR/frontend/Dockerfile"
 grep -q 'npm ci' "$ROOT_DIR/frontend/Dockerfile"
 grep -q 'npm run build' "$ROOT_DIR/frontend/Dockerfile"

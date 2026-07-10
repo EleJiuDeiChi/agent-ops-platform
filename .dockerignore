@@ -8,6 +8,10 @@ backend/*
 !backend/app/
 !backend/app/**
 !backend/requirements.txt
+!backend/requirements-dev.txt
+!backend/tests/
+!backend/tests/**
+!backend/Dockerfile.test
 
 !frontend/
 frontend/*

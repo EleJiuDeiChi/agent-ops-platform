@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DEVBOX_SSH_TARGET="${DEVBOX_SSH_TARGET:-yanyan-devbox-via-idc}"
+DEVBOX_SSH_TARGET="${DEVBOX_SSH_TARGET:-yanyan-devbox}"
 DEVBOX_PROJECT_DIR="${DEVBOX_PROJECT_DIR:-/home/ubuntu/Documents/trae_projects/业务效率工具/Agent运维平台}"
 
 ssh "$DEVBOX_SSH_TARGET" "mkdir -p '$DEVBOX_PROJECT_DIR'"

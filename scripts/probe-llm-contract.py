@@ -9,7 +9,7 @@ import json
 import os
 import re
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -65,7 +65,7 @@ def _parse_timestamp(value: Any, *, field: str) -> datetime:
         raise ProbeError(f"{field} must be an ISO-8601 timestamp") from exc
     if timestamp.tzinfo is None:
         raise ProbeError(f"{field} must include a timezone")
-    return timestamp.astimezone(UTC)
+    return timestamp.astimezone(timezone.utc)
 
 
 def _positive_decimal(value: Any, *, field: str, allow_zero: bool = False) -> Decimal:
@@ -107,7 +107,7 @@ def _load_policy(path: Path, snapshot_path: Path) -> tuple[dict[str, Any], str]:
         raise ProbeError("policy file must approve redacted operational data only")
 
     reviewed_at = _parse_timestamp(policy["reviewed_at"], field="reviewed_at")
-    now = datetime.now(UTC)
+    now = datetime.now(timezone.utc)
     if reviewed_at > now + timedelta(minutes=5) or now - reviewed_at > timedelta(days=90):
         raise ProbeError("provider policy review must be current within 90 days")
 
@@ -397,7 +397,7 @@ def run_probe(
     if estimated_cost > cost_cap:
         raise ProbeError("estimated live-probe cost exceeds approved cap")
 
-    now = datetime.now(UTC)
+    now = datetime.now(timezone.utc)
     models_hash = hashlib.sha256(models_response.content).hexdigest()
     required_checks = {
         "models": True,
