@@ -754,6 +754,7 @@ def self_test() -> None:
             "security ssh-ed25519 " + base64.b64encode(b"security-key").decode() + "\n",
             encoding="utf-8",
         )
+        allowed_signers_path.chmod(0o600)
         reviews: dict[str, Any] = {}
         for role, verdict, identity in (
             ("architecture", "CLEAR", "architect"),
