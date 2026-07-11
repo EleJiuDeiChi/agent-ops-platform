@@ -11,7 +11,12 @@ Sources:
 
 ## Git and release convention
 
-- Default branch: `main`, protected once the remote exists.
+- Repository visibility: public, after a full reachable-history secret scan.
+- Default branch: `main`, protected for administrators and contributors. It
+  requires an up-to-date branch, the `Chromium E2E` and
+  `Test, audit, build and supply-chain evidence` checks, one approval from
+  someone other than the last pusher, stale-review dismissal, resolved
+  conversations and linear history; force-push and deletion are disabled.
 - Release stabilization branches: `release/<major>.<minor>`; no direct feature
   development after freeze.
 - Signed immutable tags: `v<major>.<minor>.<patch>` pointing to the reviewed
@@ -19,8 +24,11 @@ Sources:
 - Every commit follows the repository Lore protocol: intent-first subject,
   rationale body and applicable `Constraint`, `Rejected`, `Confidence`,
   `Scope-risk`, `Directive`, `Tested`, and `Not-tested` trailers.
-- The first reviewed `main` commit is created only after local R0 gates pass.
-  Remote protection, protected release environment and signed tag remain
+- The active repository ruleset prevents updates, deletion and non-fast-forward
+  changes to matching `v*.*.*` release tags without a bypass actor. The
+  `production-release` environment accepts only matching tag refs.
+- A trusted release allowed-signers variable, independent environment
+  reviewers, a newly signed tag and its successful release evidence remain
   external release-owner actions and keep R0 `NO-GO` until evidenced.
 
 ## Delivered deployment invariants
