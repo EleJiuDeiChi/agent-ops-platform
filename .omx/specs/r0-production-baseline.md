@@ -27,9 +27,13 @@ Sources:
 - The active repository ruleset prevents updates, deletion and non-fast-forward
   changes to matching `v*.*.*` release tags without a bypass actor. The
   `production-release` environment accepts only matching tag refs.
-- A trusted release allowed-signers variable, independent environment
-  reviewers, a newly signed tag and its successful release evidence remain
-  external release-owner actions and keep R0 `NO-GO` until evidenced.
+- The repository trusts the dedicated SSH signing principal
+  `agent-ops-release@EleJiuDeiChi` through
+  `AIOPS_RELEASE_ALLOWED_SIGNERS`; its Ed25519 fingerprint is
+  `SHA256:PRx3q+2GoqeWm33uf2BaKhcuVW/dGRaHAsL3EMiaTqM` and the private key is
+  retained outside the repository. Independent environment reviewers, a newly
+  signed tag and its successful release evidence remain external release-owner
+  actions and keep R0 `NO-GO` until evidenced.
 
 ## Delivered deployment invariants
 

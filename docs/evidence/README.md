@@ -41,9 +41,12 @@ plan supports those rules. This repository is public and currently enforces
 administrator-inclusive `main` protection plus an active, no-bypass tag
 ruleset that rejects update, deletion and non-fast-forward changes for
 `v*.*.*`. The workflow also rejects an already published release version and
-serializes runs per tag. Required environment reviewers, the trusted release
-signer variable and a new signed release are still blocking evidence; repository
-rules alone do not satisfy those gates.
+serializes runs per tag. The repository now trusts the dedicated SSH principal
+`agent-ops-release@EleJiuDeiChi` through `AIOPS_RELEASE_ALLOWED_SIGNERS` with
+fingerprint `SHA256:PRx3q+2GoqeWm33uf2BaKhcuVW/dGRaHAsL3EMiaTqM`; its private
+key remains outside the repository. Required environment reviewers and a new
+signed release are still blocking evidence; repository rules alone do not
+satisfy those gates.
 
 The release job:
 
