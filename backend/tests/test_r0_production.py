@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import copy
 import hashlib
 import json
 import os
@@ -22,6 +23,7 @@ def production_environment(tmp_path: Path, now: datetime) -> dict[str, str]:
     setup_token_file.write_text("t" * 48 + "\n", encoding="utf-8")
     llm_key_file = tmp_path / "llm_api_key"
     llm_key_file.write_text("k" * 48 + "\n", encoding="utf-8")
+    llm_key_file.chmod(0o600)
     return {
         "AIOPS_ENV": "prod",
         "AIOPS_DB_PATH": str(tmp_path / "production.sqlite"),
@@ -272,6 +274,13 @@ def test_setup_enrollment_secure_cookies_and_public_health(
     now = datetime.now(UTC)
     env = production_environment(tmp_path, now)
     apply_environment(monkeypatch, env)
+    import app.support as support
+
+    monkeypatch.setattr(
+        support,
+        "read_mountinfo",
+        lambda: "25 1 8:1 / / rw,relatime - xfs /dev/root rw",
+    )
     import app.main as main
 
     importlib.reload(main)
@@ -305,6 +314,8 @@ def test_setup_enrollment_secure_cookies_and_public_health(
         preflight = client.get("/preflight")
         assert preflight.status_code == 200
         assert preflight.json()["status"] in {"supported", "unsupported_for_mutation"}
+        assert preflight.json()["detected"]["data_filesystem"] == "xfs"
+        assert preflight.json()["supported"]["data_filesystems"] == ["ext4", "xfs"]
 
         ready = client.get("/health/ready")
         assert ready.status_code == 503
@@ -449,6 +460,103 @@ def test_support_preflight_matrix() -> None:
     }
 
 
+@pytest.mark.parametrize("filesystem", ["ext4", "xfs"])
+def test_support_preflight_accepts_supported_database_filesystems(
+    filesystem: str,
+) -> None:
+    mountinfo = "\n".join(
+        [
+            "25 1 8:1 / / rw,relatime - ext4 /dev/root rw",
+            f"36 25 8:2 / /srv/aiops rw,relatime - {filesystem} /dev/data rw",
+        ]
+    )
+
+    result = evaluate_support(
+        system="Linux",
+        machine="x86_64",
+        os_release={"ID": "ubuntu", "VERSION_ID": "24.04"},
+        database_path=Path("/srv/aiops/data/control.sqlite"),
+        mountinfo_text=mountinfo,
+    )
+
+    assert result["status"] == "supported"
+    assert result["mutation_supported"] is True
+    assert result["detected"]["data_filesystem"] == filesystem
+    assert result["supported"]["data_filesystems"] == ["ext4", "xfs"]
+    assert result["reason_codes"] == []
+
+
+@pytest.mark.parametrize("filesystem", ["nfs", "nfs4", "cifs", "smb", "smb3"])
+def test_support_preflight_rejects_network_database_filesystems(
+    filesystem: str,
+) -> None:
+    result = evaluate_support(
+        system="Linux",
+        machine="x86_64",
+        os_release={"ID": "ubuntu", "VERSION_ID": "24.04"},
+        database_path=Path("/srv/aiops/control.sqlite"),
+        mountinfo_text=f"36 25 0:42 / /srv/aiops rw - {filesystem} server:/data rw",
+    )
+
+    assert result["status"] == "unsupported_for_mutation"
+    assert result["mutation_supported"] is False
+    assert result["detected"]["data_filesystem"] == filesystem
+    assert set(result["reason_codes"]) >= {
+        "network_data_filesystem",
+        "unsupported_data_filesystem",
+    }
+
+
+@pytest.mark.parametrize(
+    ("mountinfo", "expected_filesystem", "expected_reason"),
+    [
+        (
+            "36 25 0:42 / /srv/aiops rw - btrfs /dev/data rw",
+            "btrfs",
+            "unsupported_data_filesystem",
+        ),
+        ("malformed mountinfo", "unknown", "data_filesystem_unknown"),
+        ("", "unknown", "data_filesystem_unknown"),
+    ],
+)
+def test_support_preflight_fails_closed_for_other_or_unknown_filesystems(
+    mountinfo: str,
+    expected_filesystem: str,
+    expected_reason: str,
+) -> None:
+    result = evaluate_support(
+        system="Linux",
+        machine="x86_64",
+        os_release={"ID": "ubuntu", "VERSION_ID": "24.04"},
+        database_path=Path("/srv/aiops/control.sqlite"),
+        mountinfo_text=mountinfo,
+    )
+
+    assert result["status"] == "unsupported_for_mutation"
+    assert result["mutation_supported"] is False
+    assert result["detected"]["data_filesystem"] == expected_filesystem
+    assert expected_reason in result["reason_codes"]
+    assert "unsupported_data_filesystem" in result["reason_codes"]
+
+
+def test_support_preflight_decodes_mountinfo_paths_and_uses_deepest_mount() -> None:
+    result = evaluate_support(
+        system="Linux",
+        machine="x86_64",
+        os_release={"ID": "ubuntu", "VERSION_ID": "22.04"},
+        database_path=Path("/srv/aiops data/sqlite/control.sqlite"),
+        mountinfo_text="\n".join(
+            [
+                "25 1 8:1 / / rw,relatime - ext4 /dev/root rw",
+                r"36 25 8:2 / /srv/aiops\040data rw,relatime - xfs /dev/data rw",
+            ]
+        ),
+    )
+
+    assert result["status"] == "supported"
+    assert result["detected"]["data_filesystem"] == "xfs"
+
+
 def test_provider_uses_canonical_key_file_and_explicit_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -549,6 +657,7 @@ def provider_evidence_environment(
 
     env = production_environment(tmp_path, now)
     release_digest = "sha256:" + "a" * 64
+    commit_sha = "f" * 40
     evidence = {
         "schema_version": 2,
         "result": "pass",
@@ -561,6 +670,7 @@ def provider_evidence_environment(
         "provider_origin": env["AIOPS_LLM_BASE_URL"],
         "model": env["AIOPS_LLM_MODEL"],
         "release_digest": release_digest,
+        "commit_sha": commit_sha,
         "expires_at": (now + timedelta(hours=1)).isoformat(),
         "runner_identity": "test-runner",
         "evidence_path": "test-evidence/llm-evidence.json",
@@ -635,18 +745,42 @@ def provider_evidence_environment(
         "quota_pricing_evidence": {
             "account_tier": "test-approved-tier",
             "source_url": "https://provider.example.test/pricing",
+            "source_content_sha256": "sha256:" + "c" * 64,
             "snapshot_sha256": "sha256:" + "b" * 64,
+            "snapshot_schema_version": 1,
             "reviewed_at": now.isoformat(),
+            "currency": "CNY",
+            "prices_per_million_tokens": {
+                "cache_hit_input": "0.02",
+                "cache_miss_input": "1",
+                "output": "2",
+            },
+            "quota": {
+                "concurrency_limit": 2500,
+                "requests_per_minute": "provider-managed",
+                "tokens_per_minute": "provider-managed",
+                "tokens_per_day": "unlimited",
+                "balance_alert_threshold": "10",
+            },
         },
         "policy": {
             "training_opt_out_confirmed": True,
             "redacted_operational_data_only": True,
             "provider_policy_sha256": "sha256:" + "d" * 64,
+            "provider_policy_url": "https://provider.example.test/privacy",
+            "reviewed_at": now.isoformat(),
             "ai_owner": "ai-owner",
             "security_owner": "security-owner",
             "privacy_owner": "privacy-owner",
             "owner_approvals": {
-                role: {"approved": True, "approved_at": now.isoformat()}
+                role: {
+                    "role": role,
+                    "approver_identity": f"{role}-owner",
+                    "approved": True,
+                    "approved_at": now.isoformat(),
+                    "provider_policy_sha256": "sha256:" + "d" * 64,
+                    "quota_pricing_snapshot_sha256": "sha256:" + "b" * 64,
+                }
                 for role in ("ai", "security", "privacy")
             },
         },
@@ -661,6 +795,7 @@ def provider_evidence_environment(
     env.update(
         {
             "AIOPS_RELEASE_DIGEST": release_digest,
+            "AIOPS_COMMIT_SHA": commit_sha,
             "AIOPS_LLM_EVIDENCE_FILE": str(evidence_file),
             "AIOPS_LLM_EVIDENCE_SHA256": "sha256:" + hashlib.sha256(raw).hexdigest(),
         }
@@ -681,6 +816,7 @@ def provider_evidence_environment(
         ({"provider_origin": "https://different.example.test/v1"}, "llm_evidence_provider_mismatch"),
         ({"model": "different-model"}, "llm_evidence_model_mismatch"),
         ({"release_digest": "sha256:" + "b" * 64}, "llm_evidence_release_mismatch"),
+        ({"commit_sha": "e" * 40}, "llm_evidence_commit_mismatch"),
         ({"expires_at": "2000-01-01T00:00:00+00:00"}, "llm_evidence_expired"),
         ({"runner_identity": ""}, "llm_evidence_contract_incomplete"),
         (
@@ -742,6 +878,40 @@ def test_provider_evidence_must_match_deployment(
     result = validate_provider_evidence(settings, current_time=now)
     assert result.verified is False
     assert result.reason_code == reason_code
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["price_mismatch", "duplicate_approver", "approval_digest_mismatch"],
+)
+def test_provider_evidence_rejects_forged_governance_bindings(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    from app.ai.verification import validate_provider_evidence
+
+    now = datetime.now(UTC)
+    env, original = provider_evidence_environment(tmp_path, now)
+    evidence = copy.deepcopy(original)
+    if mutation == "price_mismatch":
+        evidence["quota_pricing_evidence"]["prices_per_million_tokens"]["output"] = "999"
+    elif mutation == "duplicate_approver":
+        evidence["policy"]["security_owner"] = "ai-owner"
+        evidence["policy"]["owner_approvals"]["security"]["approver_identity"] = "ai-owner"
+    else:
+        evidence["policy"]["owner_approvals"]["privacy"][
+            "quota_pricing_snapshot_sha256"
+        ] = "sha256:" + "e" * 64
+    raw = json.dumps(evidence, sort_keys=True).encode()
+    evidence_file = Path(env["AIOPS_LLM_EVIDENCE_FILE"])
+    evidence_file.chmod(0o600)
+    evidence_file.write_bytes(raw)
+    evidence_file.chmod(0o400)
+    env["AIOPS_LLM_EVIDENCE_SHA256"] = "sha256:" + hashlib.sha256(raw).hexdigest()
+    settings = load_settings(env, validate=True, current_time=now)
+    result = validate_provider_evidence(settings, current_time=now)
+    assert result.verified is False
+    assert result.reason_code == "llm_evidence_contract_incomplete"
 
 
 def test_provider_evidence_requires_protected_file_and_matching_digest(tmp_path: Path) -> None:

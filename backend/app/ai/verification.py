@@ -31,6 +31,7 @@ REQUIRED_CHECKS = (
 MAX_EVIDENCE_BYTES = 1024 * 1024
 MAX_EVIDENCE_VALIDITY = timedelta(hours=72)
 DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
 @dataclass(frozen=True)
@@ -63,15 +64,18 @@ def _finite_decimal(raw: Any) -> Decimal | None:
     return value if value.is_finite() else None
 
 
-def _manifest_contract_complete(evidence: dict[str, Any]) -> bool:
+def provider_manifest_contract_complete(evidence: dict[str, Any]) -> bool:
     required_strings = (
         "provider_id",
         "runner_identity",
         "evidence_path",
         "account_identifier",
         "region",
+        "commit_sha",
     )
     if any(not isinstance(evidence.get(name), str) or not evidence[name].strip() for name in required_strings):
+        return False
+    if not COMMIT_PATTERN.fullmatch(evidence["commit_sha"]):
         return False
     feature_flag = evidence.get("feature_flag")
     if not isinstance(feature_flag, dict):
@@ -258,7 +262,7 @@ def _manifest_contract_complete(evidence: dict[str, Any]) -> bool:
     if balance_alert_threshold is None or balance_alert_threshold < 0:
         return False
 
-    for name in ("account_tier", "source_url"):
+    for name in ("account_tier", "source_url", "currency"):
         if not isinstance(quota_pricing.get(name), str) or not quota_pricing[name].strip():
             return False
     source_url = urlparse(str(quota_pricing["source_url"]))
@@ -273,6 +277,35 @@ def _manifest_contract_complete(evidence: dict[str, Any]) -> bool:
         return False
     if not DIGEST_PATTERN.fullmatch(str(quota_pricing.get("snapshot_sha256") or "")):
         return False
+    if not DIGEST_PATTERN.fullmatch(str(quota_pricing.get("source_content_sha256") or "")):
+        return False
+    if quota_pricing.get("snapshot_schema_version") != 1:
+        return False
+    if quota_pricing.get("currency") != usage.get("currency"):
+        return False
+    snapshot_prices = quota_pricing.get("prices_per_million_tokens")
+    if not isinstance(snapshot_prices, dict):
+        return False
+    price_bindings = {
+        "cache_hit_input": "cache_hit_input",
+        "cache_miss_input": "cache_miss_input",
+        "output": "output",
+    }
+    for snapshot_name, usage_name in price_bindings.items():
+        snapshot_value = _finite_decimal(snapshot_prices.get(snapshot_name))
+        usage_value = _finite_decimal(rates.get(usage_name))
+        if snapshot_value is None or snapshot_value < 0 or snapshot_value != usage_value:
+            return False
+    snapshot_quota = quota_pricing.get("quota")
+    if not isinstance(snapshot_quota, dict) or set(snapshot_quota) != set(quota):
+        return False
+    for name in quota:
+        if name == "balance_alert_threshold":
+            snapshot_threshold = _finite_decimal(snapshot_quota.get(name))
+            if snapshot_threshold is None or snapshot_threshold != balance_alert_threshold:
+                return False
+        elif snapshot_quota.get(name) != quota.get(name):
+            return False
     quota_pricing_reviewed_at = _parse_expiry(quota_pricing.get("reviewed_at"))
     if quota_pricing_reviewed_at is None:
         return False
@@ -283,19 +316,129 @@ def _manifest_contract_complete(evidence: dict[str, Any]) -> bool:
         return False
     if not DIGEST_PATTERN.fullmatch(str(policy.get("provider_policy_sha256") or "")):
         return False
+    provider_policy_url = urlparse(str(policy.get("provider_policy_url") or ""))
+    if (
+        provider_policy_url.scheme != "https"
+        or not provider_policy_url.netloc
+        or provider_policy_url.username
+        or provider_policy_url.password
+        or provider_policy_url.query
+        or provider_policy_url.fragment
+    ):
+        return False
+    provider_reviewed_at = _parse_expiry(policy.get("reviewed_at"))
+    if provider_reviewed_at is None:
+        return False
     for owner in ("ai_owner", "security_owner", "privacy_owner"):
         if not isinstance(policy.get(owner), str) or not policy[owner].strip():
             return False
     approvals = policy.get("owner_approvals")
     if not isinstance(approvals, dict):
         return False
+    approver_identities: set[str] = set()
     for role in ("ai", "security", "privacy"):
         approval = approvals.get(role)
         if not isinstance(approval, dict) or approval.get("approved") is not True:
             return False
-        if _parse_expiry(approval.get("approved_at")) is None:
+        if approval.get("role") != role:
+            return False
+        identity = str(approval.get("approver_identity") or "").strip()
+        if not identity or identity != policy.get(f"{role}_owner"):
+            return False
+        normalized_identity = identity.casefold()
+        if normalized_identity in approver_identities:
+            return False
+        approver_identities.add(normalized_identity)
+        if approval.get("provider_policy_sha256") != policy.get("provider_policy_sha256"):
+            return False
+        if approval.get("quota_pricing_snapshot_sha256") != quota_pricing.get("snapshot_sha256"):
+            return False
+        approved_at = _parse_expiry(approval.get("approved_at"))
+        if approved_at is None:
+            return False
+        if approved_at < max(provider_reviewed_at, quota_pricing_reviewed_at):
             return False
     return True
+
+
+def provider_manifest_validation_error(
+    evidence: Any,
+    *,
+    current_time: datetime | None = None,
+    expected_provider_id: str | None = None,
+    expected_provider_origin: str | None = None,
+    expected_model: str | None = None,
+    expected_release_digest: str | None = None,
+    expected_commit_sha: str | None = None,
+) -> str | None:
+    """Return a stable reason code when provider evidence is not release-ready."""
+    if not isinstance(evidence, dict) or evidence.get("schema_version") != 2:
+        return "llm_evidence_schema_invalid"
+    if evidence.get("result") != "pass":
+        return "llm_evidence_result_not_pass"
+    if not provider_manifest_contract_complete(evidence):
+        return "llm_evidence_contract_incomplete"
+    if expected_provider_id is not None:
+        if evidence.get("provider_id") != expected_provider_id:
+            return "llm_evidence_provider_id_mismatch"
+        feature_flag = evidence.get("feature_flag") or {}
+        if feature_flag.get("enabled_provider_id") != expected_provider_id:
+            return "llm_evidence_feature_flag_mismatch"
+    if (
+        expected_provider_origin is not None
+        and evidence.get("provider_origin") != expected_provider_origin.rstrip("/")
+    ):
+        return "llm_evidence_provider_mismatch"
+    if expected_model is not None and evidence.get("model") != expected_model:
+        return "llm_evidence_model_mismatch"
+    if (
+        expected_release_digest is not None
+        and evidence.get("release_digest") != expected_release_digest
+    ):
+        return "llm_evidence_release_mismatch"
+    if expected_commit_sha is not None and evidence.get("commit_sha") != expected_commit_sha:
+        return "llm_evidence_commit_mismatch"
+
+    executed_at = _parse_expiry(evidence.get("executed_at"))
+    expires_at = _parse_expiry(evidence.get("expires_at"))
+    quota_pricing_reviewed_at = _parse_expiry(
+        (evidence.get("quota_pricing_evidence") or {}).get("reviewed_at")
+    )
+    policy_reviewed_at = _parse_expiry((evidence.get("policy") or {}).get("reviewed_at"))
+    approval_times = [
+        _parse_expiry(approval.get("approved_at"))
+        for approval in ((evidence.get("policy") or {}).get("owner_approvals") or {}).values()
+        if isinstance(approval, dict)
+    ]
+    now = (current_time or datetime.now(UTC)).astimezone(UTC)
+    if (
+        executed_at is None
+        or expires_at is None
+        or executed_at > now + timedelta(minutes=5)
+        or expires_at <= now
+        or expires_at <= executed_at
+        or expires_at - executed_at > MAX_EVIDENCE_VALIDITY
+        or quota_pricing_reviewed_at is None
+        or quota_pricing_reviewed_at > executed_at + timedelta(minutes=5)
+        or executed_at - quota_pricing_reviewed_at > timedelta(days=30)
+        or policy_reviewed_at is None
+        or policy_reviewed_at > executed_at + timedelta(minutes=5)
+        or executed_at - policy_reviewed_at > timedelta(days=90)
+        or len(approval_times) != 3
+        or any(approved_at is None for approved_at in approval_times)
+        or any(
+            approved_at > executed_at + timedelta(minutes=5)
+            for approved_at in approval_times
+            if approved_at
+        )
+    ):
+        return "llm_evidence_expired"
+    checks = evidence.get("required_checks")
+    if not isinstance(checks, dict) or any(
+        checks.get(name) is not True for name in REQUIRED_CHECKS
+    ):
+        return "llm_evidence_checks_incomplete"
+    return None
 
 
 def validate_provider_evidence(
@@ -308,6 +451,8 @@ def validate_provider_evidence(
         return ProviderVerification(verified=True, reason_code=None)
     if settings.release_digest is None:
         return _unverified("release_digest_unconfigured")
+    if settings.commit_sha is None:
+        return _unverified("release_commit_unconfigured")
     if settings.llm_evidence_file is None or settings.llm_evidence_sha256 is None:
         return _unverified("llm_evidence_unconfigured")
 
@@ -335,45 +480,18 @@ def validate_provider_evidence(
         evidence = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError):
         return _unverified("llm_evidence_invalid")
-    if not isinstance(evidence, dict) or evidence.get("schema_version") != 2:
-        return _unverified("llm_evidence_schema_invalid")
-    if evidence.get("result") != "pass":
-        return _unverified("llm_evidence_result_not_pass")
-    if not _manifest_contract_complete(evidence):
-        return _unverified("llm_evidence_contract_incomplete")
-
-    expected_provider = (settings.llm_base_url or "").rstrip("/")
-    if evidence.get("provider_id") != settings.llm_mode:
-        return _unverified("llm_evidence_provider_id_mismatch")
-    feature_flag = evidence.get("feature_flag") or {}
+    validation_error = provider_manifest_validation_error(
+        evidence,
+        current_time=current_time,
+        expected_provider_id=settings.llm_mode,
+        expected_provider_origin=settings.llm_base_url or "",
+        expected_model=settings.llm_model,
+        expected_release_digest=settings.release_digest,
+        expected_commit_sha=settings.commit_sha,
+    )
+    if validation_error is not None:
+        return _unverified(validation_error)
+    feature_flag = evidence.get("feature_flag")
     if feature_flag.get("enabled_provider_id") not in settings.llm_enabled_providers:
         return _unverified("llm_evidence_feature_flag_mismatch")
-    if evidence.get("provider_origin") != expected_provider:
-        return _unverified("llm_evidence_provider_mismatch")
-    if evidence.get("model") != settings.llm_model:
-        return _unverified("llm_evidence_model_mismatch")
-    if evidence.get("release_digest") != settings.release_digest:
-        return _unverified("llm_evidence_release_mismatch")
-
-    executed_at = _parse_expiry(evidence.get("executed_at"))
-    expires_at = _parse_expiry(evidence.get("expires_at"))
-    quota_pricing_reviewed_at = _parse_expiry(
-        (evidence.get("quota_pricing_evidence") or {}).get("reviewed_at")
-    )
-    now = (current_time or datetime.now(UTC)).astimezone(UTC)
-    if (
-        executed_at is None
-        or expires_at is None
-        or executed_at > now + timedelta(minutes=5)
-        or expires_at <= now
-        or expires_at <= executed_at
-        or expires_at - executed_at > MAX_EVIDENCE_VALIDITY
-        or quota_pricing_reviewed_at is None
-        or quota_pricing_reviewed_at > executed_at + timedelta(minutes=5)
-        or executed_at - quota_pricing_reviewed_at > timedelta(days=30)
-    ):
-        return _unverified("llm_evidence_expired")
-    checks = evidence.get("required_checks")
-    if not isinstance(checks, dict) or any(checks.get(name) is not True for name in REQUIRED_CHECKS):
-        return _unverified("llm_evidence_checks_incomplete")
     return ProviderVerification(verified=True, reason_code=None)

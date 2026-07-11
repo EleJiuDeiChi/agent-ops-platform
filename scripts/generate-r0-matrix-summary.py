@@ -55,6 +55,7 @@ def validate_runs(
     for name, expected_variant in EXPECTED_VARIANTS.items():
         run = runs_by_name[name]
         require(run.get("result") == "passed", f"{name}: result is not passed")
+        require(run.get("artifact_class") == "signed_release", f"{name}: artifact is not a signed release")
         require(run.get("commit_sha") == commit, f"{name}: commit mismatch")
         require(run.get("source_archive_sha256") == source_sha, f"{name}: source archive mismatch")
         require(run.get("registry_image") == registry_image, f"{name}: registry image mismatch")
@@ -85,6 +86,46 @@ def validate_runs(
             bool(OCI_DIGEST_RE.fullmatch(str(run.get("frontend_release_digest", "")))),
             f"{name}: frontend digest invalid",
         )
+        require(
+            run.get("upstream_backend_image_ref", "").endswith(f"@{run['release_digest']}"),
+            f"{name}: upstream backend reference does not match the release digest",
+        )
+        require(
+            run.get("upstream_frontend_image_ref", "").endswith(
+                f"@{run['frontend_release_digest']}"
+            ),
+            f"{name}: upstream frontend reference does not match the release digest",
+        )
+        require(
+            bool(OCI_DIGEST_RE.fullmatch(str(run.get("release_manifest_sha256", "")))),
+            f"{name}: release manifest digest is invalid",
+        )
+        require(
+            run.get("release_manifest_path")
+            == f"{EVIDENCE_PREFIX}/release-manifest-{run_id}.json",
+            f"{name}: release manifest path mismatch",
+        )
+        require(run.get("release_tag_signature_verified") is True, f"{name}: release tag signature is unverified")
+        for field in ("backend_cosign_verification_sha256", "frontend_cosign_verification_sha256"):
+            require(
+                bool(OCI_DIGEST_RE.fullmatch(str(run.get(field, "")))),
+                f"{name}: {field} is invalid",
+            )
+        for image_name in ("backend", "frontend"):
+            path_field = f"{image_name}_cosign_verification_path"
+            expected = f"{EVIDENCE_PREFIX}/{image_name}-cosign-{run_id}.json"
+            require(run.get(path_field) == expected, f"{name}: {path_field} mismatch")
+            for evidence_kind in ("provenance", "sbom"):
+                path_field = f"{image_name}_{evidence_kind}_verification_path"
+                digest_field = f"{image_name}_{evidence_kind}_verification_sha256"
+                expected = (
+                    f"{EVIDENCE_PREFIX}/{image_name}-{evidence_kind}-{run_id}.json"
+                )
+                require(run.get(path_field) == expected, f"{name}: {path_field} mismatch")
+                require(
+                    bool(OCI_DIGEST_RE.fullmatch(str(run.get(digest_field, "")))),
+                    f"{name}: {digest_field} is invalid",
+                )
 
         sqlite = run.get("sqlite_storage")
         require(isinstance(sqlite, dict), f"{name}: SQLite storage evidence is missing")
@@ -105,6 +146,10 @@ def validate_runs(
         len({run["frontend_release_digest"] for run in ordered}) == 1,
         "frontend OCI digests differ across variants",
     )
+    require(
+        len({run["release_manifest_sha256"] for run in ordered}) == 1,
+        "release manifest differs across variants",
+    )
     for os_version in ("22.04", "24.04"):
         os_runs = [run for run in ordered if run["os_version"] == os_version]
         require(len({run["cloud_image_sha256"] for run in os_runs}) == 1, f"Ubuntu {os_version} fixture hashes differ")
@@ -115,11 +160,34 @@ def validate_runs(
 def evidence_hashes(root: Path, runs: list[dict[str, Any]]) -> dict[str, str]:
     hashes: dict[str, str] = {}
     for run in runs:
-        for key in ("evidence_path", "raw_log_path"):
+        for key in (
+            "evidence_path",
+            "raw_log_path",
+            "release_manifest_path",
+            "backend_cosign_verification_path",
+            "frontend_cosign_verification_path",
+            "backend_provenance_verification_path",
+            "frontend_provenance_verification_path",
+            "backend_sbom_verification_path",
+            "frontend_sbom_verification_path",
+        ):
             relative = Path(run[key])
             require(not relative.is_absolute() and ".." not in relative.parts, f"unsafe evidence path: {relative}")
             path = verified_artifact_path(root, relative)
-            hashes[str(relative)] = hashlib.sha256(path.read_bytes()).hexdigest()
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            hashes[str(relative)] = digest
+            if key.endswith("_verification_path"):
+                prefix = key.removesuffix("_verification_path")
+                require(
+                    run[f"{prefix}_verification_sha256"]
+                    == f"sha256:{digest}",
+                    f"{run['evidence_name']}: {prefix} evidence hash mismatch",
+                )
+            elif key == "release_manifest_path":
+                require(
+                    run["release_manifest_sha256"] == f"sha256:{digest}",
+                    f"{run['evidence_name']}: release manifest evidence hash mismatch",
+                )
     return hashes
 
 
@@ -176,6 +244,12 @@ def build_summary(
         "owner": "backend and release leads",
         "release_digest": runs[0]["release_digest"],
         "frontend_release_digest": runs[0]["frontend_release_digest"],
+        "artifact_class": "signed_release",
+        "upstream_backend_image_ref": runs[0]["upstream_backend_image_ref"],
+        "upstream_frontend_image_ref": runs[0]["upstream_frontend_image_ref"],
+        "release_manifest_sha256": runs[0]["release_manifest_sha256"],
+        "release_manifest_path": runs[0]["release_manifest_path"],
+        "release_tag": runs[0]["release_tag"],
         "result": "passed",
         "executed_at": datetime.now(timezone.utc).isoformat(),
         "commit_sha": commit,
@@ -282,6 +356,25 @@ def synthetic_runs() -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
             "raw_log_path": f"{EVIDENCE_PREFIX}/{name}-{run_id}.log",
             "release_digest": "sha256:" + "d" * 64,
             "frontend_release_digest": "sha256:" + "e" * 64,
+            "artifact_class": "signed_release",
+            "upstream_backend_image_ref": "ghcr.io/example/backend@sha256:" + "d" * 64,
+            "upstream_frontend_image_ref": "ghcr.io/example/frontend@sha256:" + "e" * 64,
+            "release_manifest_sha256": "sha256:" + "f" * 64,
+            "release_manifest_path": f"{EVIDENCE_PREFIX}/release-manifest-{run_id}.json",
+            "release_tag": "v1.2.3",
+            "release_tag_signature_verified": True,
+            "backend_cosign_verification_sha256": "sha256:" + "6" * 64,
+            "frontend_cosign_verification_sha256": "sha256:" + "7" * 64,
+            "backend_cosign_verification_path": f"{EVIDENCE_PREFIX}/backend-cosign-{run_id}.json",
+            "frontend_cosign_verification_path": f"{EVIDENCE_PREFIX}/frontend-cosign-{run_id}.json",
+            "backend_provenance_verification_sha256": "sha256:" + "8" * 64,
+            "frontend_provenance_verification_sha256": "sha256:" + "9" * 64,
+            "backend_sbom_verification_sha256": "sha256:" + "a" * 64,
+            "frontend_sbom_verification_sha256": "sha256:" + "b" * 64,
+            "backend_provenance_verification_path": f"{EVIDENCE_PREFIX}/backend-provenance-{run_id}.json",
+            "frontend_provenance_verification_path": f"{EVIDENCE_PREFIX}/frontend-provenance-{run_id}.json",
+            "backend_sbom_verification_path": f"{EVIDENCE_PREFIX}/backend-sbom-{run_id}.json",
+            "frontend_sbom_verification_path": f"{EVIDENCE_PREFIX}/frontend-sbom-{run_id}.json",
             "sqlite_storage": {
                 "volume_name": f"{name}_aiops_data",
                 "volume_mountpoint": f"/var/lib/docker/volumes/{name}_aiops_data/_data",
@@ -303,6 +396,7 @@ def self_test() -> None:
     validate_runs(baseline, **context)
     mutations = (
         ("result", "failed"),
+        ("artifact_class", "diagnostic"),
         ("commit_sha", "f" * 40),
         ("source_archive_sha256", "0" * 64),
         ("registry_image", "other@sha256:" + "1" * 64),
@@ -319,6 +413,23 @@ def self_test() -> None:
         ("raw_log_path", "/tmp/forged.log"),
         ("release_digest", "sha256:bad"),
         ("frontend_release_digest", "sha256:bad"),
+        ("upstream_backend_image_ref", "ghcr.io/example/backend:latest"),
+        ("upstream_frontend_image_ref", "ghcr.io/example/frontend:latest"),
+        ("release_manifest_sha256", "sha256:bad"),
+        ("release_manifest_path", "/tmp/forged.json"),
+        ("release_tag_signature_verified", False),
+        ("backend_cosign_verification_sha256", "sha256:bad"),
+        ("frontend_cosign_verification_sha256", "sha256:bad"),
+        ("backend_cosign_verification_path", "/tmp/forged.json"),
+        ("frontend_cosign_verification_path", "/tmp/forged.json"),
+        ("backend_provenance_verification_sha256", "sha256:bad"),
+        ("frontend_provenance_verification_sha256", "sha256:bad"),
+        ("backend_sbom_verification_sha256", "sha256:bad"),
+        ("frontend_sbom_verification_sha256", "sha256:bad"),
+        ("backend_provenance_verification_path", "/tmp/forged.json"),
+        ("frontend_provenance_verification_path", "/tmp/forged.json"),
+        ("backend_sbom_verification_path", "/tmp/forged.json"),
+        ("frontend_sbom_verification_path", "/tmp/forged.json"),
     )
     target = next(iter(EXPECTED_VARIANTS))
     for field, value in mutations:
@@ -381,12 +492,35 @@ def self_test() -> None:
         root = Path(temporary)
         evidence_dir = root / EVIDENCE_PREFIX
         evidence_dir.mkdir(parents=True)
+        shared_fixture = b"{}\n"
+        shared_fixture_digest = "sha256:" + hashlib.sha256(shared_fixture).hexdigest()
+        for run in baseline.values():
+            run["release_manifest_sha256"] = shared_fixture_digest
+            for prefix in (
+                "backend_cosign",
+                "frontend_cosign",
+                "backend_provenance",
+                "frontend_provenance",
+                "backend_sbom",
+                "frontend_sbom",
+            ):
+                run[f"{prefix}_verification_sha256"] = shared_fixture_digest
         for name, run in baseline.items():
             (evidence_dir / f"{name}.json").write_text(
                 json.dumps(run, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
             (evidence_dir / f"{name}-{context['run_id']}.log").write_text("self-test log\n", encoding="utf-8")
+        for name in (
+            "release-manifest",
+            "backend-cosign",
+            "frontend-cosign",
+            "backend-provenance",
+            "frontend-provenance",
+            "backend-sbom",
+            "frontend-sbom",
+        ):
+            (evidence_dir / f"{name}-{context['run_id']}.json").write_bytes(shared_fixture)
         payload = build_summary(
             root=root,
             evidence_dir=evidence_dir,
@@ -396,7 +530,7 @@ def self_test() -> None:
             run_id=context["run_id"],
         )
         require(payload["result"] == "passed", "full-path self-test did not produce a passed payload")
-        require(len(payload["evidence_sha256"]) == 8, "full-path self-test did not hash all artifacts")
+        require(len(payload["evidence_sha256"]) == 15, "full-path self-test did not hash all artifacts")
         publish_summary(evidence_dir, payload, run_id=context["run_id"], commit=context["commit"])
         require((evidence_dir / "matrix-summary.json").is_file(), "summary was not published")
         require(json.loads((evidence_dir / "matrix-status.json").read_text())["result"] == "passed", "passed status was not published")

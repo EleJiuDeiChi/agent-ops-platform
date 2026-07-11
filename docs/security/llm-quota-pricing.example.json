@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "provider_id": "REPLACE_WITH_deepseek_moonshot_or_zhipu",
+  "account_identifier": "REPLACE_WITH_NON_SECRET_ACCOUNT_ID",
+  "account_tier": "REPLACE_WITH_REVIEWED_ACCOUNT_TIER",
+  "source_url": "REPLACE_WITH_CREDENTIAL_FREE_HTTPS_PRICING_OR_QUOTA_URL",
+  "source_content_sha256": "sha256:REPLACE_WITH_EXACT_SOURCE_BYTES_DIGEST",
+  "reviewed_at": "REPLACE_WITH_UTC_ISO8601",
+  "currency": "REPLACE_WITH_REVIEWED_CURRENCY",
+  "prices_per_million_tokens": {
+    "cache_hit_input": "REPLACE_WITH_NON_NEGATIVE_RATE",
+    "cache_miss_input": "REPLACE_WITH_NON_NEGATIVE_RATE",
+    "output": "REPLACE_WITH_NON_NEGATIVE_RATE"
+  },
+  "quota": {
+    "concurrency_limit": "REPLACE_WITH_POSITIVE_INTEGER_OR_ACCOUNT_TIER",
+    "requests_per_minute": "REPLACE_WITH_POSITIVE_INTEGER_OR_PROVIDER_MANAGED",
+    "tokens_per_minute": "REPLACE_WITH_POSITIVE_INTEGER_OR_PROVIDER_MANAGED",
+    "tokens_per_day": "REPLACE_WITH_POSITIVE_INTEGER_OR_UNLIMITED",
+    "balance_alert_threshold": "REPLACE_WITH_NON_NEGATIVE_AMOUNT"
+  }
+}

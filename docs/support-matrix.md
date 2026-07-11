@@ -17,13 +17,13 @@ Status vocabulary:
 
 | Area | Intended first-GA range | Evidence in this checkout / boundary | Status |
 | --- | --- | --- | --- |
-| OS | Ubuntu Server 22.04 LTS and 24.04 LTS, x86_64 | The clean-KVM gate requires both OS releases on both supported filesystems. Exact kernel, commit and source-archive hash are accepted only from generated `matrix-summary.json`. The images remain diagnostic, not signed release artifacts. | EVIDENCE-ONLY |
+| OS | Ubuntu Server 22.04 LTS and 24.04 LTS, x86_64 | The clean-KVM gate requires both OS releases on both supported filesystems and consumes only exact Cosign-verified GHCR release digests. Historical evidence is stale until the final release commit is rerun. | EVIDENCE-ONLY |
 | Filesystem | local ext4 or xfs | The gate requires four OS/filesystem combinations. For xfs it attaches a dedicated disk at `/var/lib/docker`; every run verifies the actual SQLite named volume filesystem. SQLite on NFS/SMB is explicitly rejected. | EVIDENCE-ONLY |
 | Init/firewall | systemd + UFW | Mutation remains disabled; no destructive-lab evidence. | TARGET |
 | Docker Engine | Candidate release lines 28.x and 29.x, exact patch captured per release test | All four clean-VM runs must consume the same backend/frontend OCI manifests. CI must repeat against the protected release digest before `SUPPORTED`. | EVIDENCE-ONLY |
 | Docker Compose | Compose plugin that supports the checked production schema, `config --format json`, health dependencies and secrets | Every clean-VM run records the exact Compose patch version. The release floor/ceiling is not a support promise until signed-release CI repeats it. | EVIDENCE-ONLY |
-| Platform frontend | Build input `node:22.23.1-bookworm-slim`; runtime input `nginx:1.28.3-alpine3.23` | The diagnostic OCI digest recorded in generated `matrix-summary.json` must pass all four clean-VM combinations. It is unsigned and cannot become a GA release. | EVIDENCE-ONLY |
-| Platform backend | Build input `python:3.12.13-slim-bookworm` | The diagnostic OCI digest recorded in generated `matrix-summary.json` must pass all four clean-VM combinations. The protected release must reproduce, scan and sign its own digest. | EVIDENCE-ONLY |
+| Platform frontend | Build input `node:22.23.1-bookworm-slim`; runtime input `alpine:3.23.5` with `nginx~1.28.3` | The exact signed GHCR digest from canonical `GA-R0-002` must pass all four clean-VM combinations; a locally rebuilt image is rejected. | EVIDENCE-ONLY |
+| Platform backend | Runtime input `python:3.12-alpine3.23` | The exact signed GHCR digest from canonical `GA-R0-002` must pass all four clean-VM combinations and bind the live provider manifest. | EVIDENCE-ONLY |
 | Managed Nginx | Ubuntu distribution Nginx | Read-only diagnostics only; exact apt version is captured by the future clean-VM/R4C manifest. | TARGET |
 | ACME | HTTP-01 only | No live ACME evidence. DNS-01 is outside first GA. | TARGET |
 
@@ -69,8 +69,9 @@ Engine/Compose package versions, source archive, commit and both OCI digests.
 The lab uses
 an ephemeral registry bound only to loopback and the libvirt bridge so Docker
 28 and 29 pull the same manifest rather than comparing unstable local config
-IDs. Passing diagnostic manifests do not replace GHCR, Trivy, SBOM, provenance
-or signature evidence.
+IDs. The harness validates canonical `GA-R0-002`, verifies Cosign signatures,
+and mirrors the exact GHCR manifest digests; diagnostic rebuilds cannot produce
+passing matrix evidence.
 
 ## Live multi-provider LLM contract
 
@@ -84,6 +85,9 @@ until their own live probe and governance review pass.
 exactly the selected `AIOPS_LLM_MODE`; enabling multiple providers or omitting
 the selected provider fails startup. A provider can enter the release flag only
 after its own account, policy and live evidence are approved.
+Production and live probes accept provider credentials only through one
+protected `*_API_KEY_FILE`; direct API-key environment values are unsupported
+and rejected fail-closed.
 
 | Provider ID | Candidate model | Frozen production origin | Model confirmation | Provider-specific notes | Status |
 | --- | --- | --- | --- | --- | --- |
@@ -102,7 +106,12 @@ Every provider must independently prove:
   prices, account concurrency/RPM/TPM/TPD limits, balance-alert threshold,
   pre-spend per-probe cost cap covering potentially billed retries, SSE media
   type/event hash and seeded-secret redaction capture;
-- an immutable provider-policy snapshot and a manifest bound to provider ID,
+- a structured immutable quota/pricing JSON snapshot whose provider, account,
+  tier, source URL, review instant, currency, three prices and every quota field
+  match the policy semantically, plus a separate digest of the live source bytes;
+- an immutable provider-policy snapshot and three distinct AI/security/privacy
+  approval identities, each matching its declared owner and binding both
+  evidence snapshot digests, with the resulting manifest bound to provider ID,
   account, model, release digest and expiry.
 
 Only redacted operational facts may leave the control plane. Secrets, personal

@@ -55,16 +55,58 @@ accounts. A successful HTTP request alone is insufficient.
 Set `AIOPS_LLM_ENABLED_PROVIDERS` to exactly the selected `AIOPS_LLM_MODE`.
 This is the provider release flag: production rejects a missing flag, multiple
 providers, an unknown provider, or a provider different from the active mode.
+Production and the live probe accept LLM credentials only through one protected
+`*_API_KEY_FILE` variable, for example `AIOPS_DEEPSEEK_API_KEY_FILE`. Direct
+`AIOPS_LLM_API_KEY`, `AIOPS_DEEPSEEK_API_KEY`, `AIOPS_MOONSHOT_API_KEY` and
+`AIOPS_ZHIPU_API_KEY` environment values are forbidden, including when a file
+variable is also present. The probe rejects symlinks, non-regular files,
+group/other access and files not owned by root or the probe operator; use mode
+`0600` or stricter.
 
 Copy `docs/security/llm-provider-policy.example.json` to a protected working
 file, replace every placeholder, save the exact reviewed provider-policy page
 as a snapshot, and record that snapshot's SHA-256 plus all three owner
 approvals. Save a second immutable snapshot of the reviewed account-tier quota
-and pricing source. Record its exact credential-free HTTPS source URL, SHA-256,
-review time and account tier alongside the selected account's concurrency/RPM/TPM/TPD limits,
-balance-alert threshold and cache-hit/cache-miss/output rates; use an explicit
-approved marker only where the provider manages or tiers a limit. Set
+and pricing source by copying
+`docs/security/llm-quota-pricing.example.json` to a protected UTF-8 JSON file.
+It has exactly this shape (values shown are placeholders):
+
+```json
+{
+  "schema_version": 1,
+  "provider_id": "deepseek",
+  "account_identifier": "non-secret-account-id",
+  "account_tier": "reviewed-tier",
+  "source_url": "https://provider.example/pricing",
+  "source_content_sha256": "sha256:<64-lowercase-hex>",
+  "reviewed_at": "2026-07-11T00:00:00Z",
+  "currency": "CNY",
+  "prices_per_million_tokens": {
+    "cache_hit_input": "0",
+    "cache_miss_input": "0",
+    "output": "0"
+  },
+  "quota": {
+    "concurrency_limit": "account-tier",
+    "requests_per_minute": "provider-managed",
+    "tokens_per_minute": "provider-managed",
+    "tokens_per_day": "unlimited",
+    "balance_alert_threshold": "0"
+  }
+}
+```
+
+`source_content_sha256` is the digest of the exact bytes retrieved from
+`source_url`; `quota_pricing_snapshot_sha256` is the digest of this structured
+JSON file. The probe checks the JSON provider, account, tier, source URL, review
+instant, currency, three prices and every quota field against the policy using
+typed semantics, then separately verifies the live source bytes. AI, security
+and privacy approvals require three different identities matching their owner
+fields, must be created after both reviews, and must repeat both snapshot
+digests. Use an explicit approved marker only where the provider manages or
+tiers a limit. Set
 `AIOPS_RELEASE_DIGEST` to the immutable backend image digest and
+`AIOPS_COMMIT_SHA` to the reviewed 40-character release commit, and
 `AIOPS_EVIDENCE_RUNNER_IDENTITY` to the accountable operator or CI identity,
 then run:
 
@@ -76,11 +118,14 @@ then run:
   --output .omx/evidence/production-ga/GA-R0-001/llm-contract.json
 ```
 
-The probe verifies both live source URLs still hash to their reviewed snapshots,
+The probe verifies the policy URL and live quota/pricing source still hash to
+their independently reviewed evidence,
 provider-specific authenticated model discovery, exact model, typed tool calling, SSE media type,
 contract marker, normalized event hash and provider-specific cache usage,
 bounded timeout/retry, invalid-tool rejection, seeded-secret redaction and
-usage/cost limits. The preflight budget uses a conservative serialized-payload
+usage/cost limits. It rejects arbitrary or semantically mismatched quota/pricing
+snapshot bytes and approvals that do not bind both snapshot digests. The
+preflight budget uses a conservative serialized-payload
 byte bound and includes every potentially billed tool retry before any provider
 request. The probe also binds those limits to the reviewed quota/pricing snapshot.
 It writes the manifest read-only and prints the exact
@@ -91,6 +136,14 @@ call the provider. Missing or stale evidence keeps readiness at
 `llm_unverified` and makes diagnosis return 503.
 
 ## 3. First-time enrollment
+
+Before publishing a release, provision a dedicated SSH release-signing key
+outside the repository. Store its allowed-signers line (`principal`, key type
+and public key) in the repository variable `AIOPS_RELEASE_ALLOWED_SIGNERS`.
+Create the annotated semantic tag with Git SSH signing. The release workflow
+rejects lightweight tags, unsigned tags, untrusted signers and commits that are
+not reachable from `main` or `release/*`. The private signing key must never be
+stored in Actions, the repository or a development `.env` file.
 
 Start the one-time setup override only on an uninitialized data volume. The
 supported installation path is the verification wrapper below; direct
@@ -141,7 +194,15 @@ Expected R0 readiness explicitly reports Worker and Agent as
 recorded. Mutating/destructive capabilities must be disabled and must never
 write a success task/event.
 
-For the R0 clean-host gate, run the following only on the designated Linux KVM
+For the R0 clean-host gate, first download the canonical `GA-R0-002` artifact
+from the successful signed-tag workflow into a protected path outside the clean
+Git checkout. Authenticate Docker on
+the lab host for read-only access to the private GHCR images and install Cosign
+3.1.1. The matrix refuses locally rebuilt backend/frontend images: it verifies
+both exact GHCR digests with Cosign, mirrors those immutable manifests through
+the ephemeral lab registry, and requires every VM to pull the same digests.
+
+Run the gate only on the designated Linux KVM
 lab host with passwordless sudo and the libvirt `default` network. It downloads
 Ubuntu official cloud images, verifies their published SHA-256 sums, creates
 namespaced disposable guests and destroys them after success. The xfs cases
@@ -149,6 +210,8 @@ also attach a dedicated disposable data disk before Docker installation:
 
 ```bash
 AIOPS_SOURCE_COMMIT="$(git rev-parse HEAD)" \
+  AIOPS_R0_RELEASE_MANIFEST="/protected/path/GA-R0-002/manifest.json" \
+  AIOPS_R0_EXPECTED_REPOSITORY="OWNER/REPO" \
   ./scripts/test-r0-clean-vm-matrix.sh
 ```
 
@@ -159,10 +222,44 @@ remote gate. The archive is integrity-bound to the authenticated SSH transfer;
 it is not described as independently signed:
 
 ```bash
-./scripts/run-r0-clean-vm-matrix-devbox.sh
+AIOPS_R0_RELEASE_MANIFEST="/protected/path/GA-R0-002/manifest.json" \
+  ./scripts/run-r0-clean-vm-matrix-devbox.sh
 ```
 
-The harness must report the same backend and frontend OCI manifest digests for
+After a successful remote run, the wrapper copies the generated GA-R0-001
+matrix manifests, logs, Cosign receipts, summary and status back into the local
+evidence directory. It never replaces the aggregate `manifest.json`; that file
+is created only by `assemble-r0-baseline-manifest.py` after the live LLM and
+independent review artifacts are also present.
+
+Architecture and security reviewers must each sign their own JSON statement
+with `ssh-keygen -Y sign -n aiops-r0-review`. Each statement binds the exact
+commit plus SHA-256 values of the matrix summary, GA-R0-002 manifest and live
+LLM manifest. The review manifest points to both statements, their detached
+signatures. The assembler receives the protected `allowed_signers` trust file
+as an external CLI input; the review manifest is forbidden from nominating its
+own trust root. The two signer identities and SSH key fingerprints must both be
+distinct. Assemble only after those signatures verify:
+
+```bash
+./scripts/assemble-r0-baseline-manifest.py \
+  --commit "$(git rev-parse HEAD)" \
+  --expected-repository "OWNER/REPO" \
+  --review-allowed-signers "/protected/path/reviewers.allowed" \
+  --matrix-summary .omx/evidence/production-ga/GA-R0-001/matrix-summary.json \
+  --matrix-status .omx/evidence/production-ga/GA-R0-001/matrix-status.json \
+  --release-manifest .omx/evidence/production-ga/GA-R0-002/manifest.json \
+  --llm-manifest .omx/evidence/production-ga/GA-R0-001/llm.json \
+  --review-manifest .omx/evidence/production-ga/GA-R0-001/review.json
+```
+
+Finally sign the aggregate with namespace `aiops-r0-aggregate` and run
+`validate-ga-manifest.py` with `--root`, `--signature`, `--allowed-signers`
+and `--signer-identity`. The validator re-hashes every referenced artifact;
+an unsigned or locally edited aggregate is not accepted.
+
+The harness must report the same signed backend and frontend GHCR manifest
+digests for
 Ubuntu 22.04/Docker 28 and Ubuntu 24.04/Docker 29 across both ext4 and xfs.
 It must also prove that Docker's real data root and the production SQLite named
 volume use the expected filesystem and that the database passes SQLite
@@ -176,8 +273,10 @@ accepted evidence.
 docker compose --env-file .env.production -f deploy/compose.prod.yml down
 ```
 
-R0 does not provide a signed release, N/N-1 upgrade, tested application
-rollback, consistent off-host backup, or clean-host restore. Do not use the
+R0 contains a signed-release pipeline, but no release is production-accepted
+until the signed tag, GitHub Release, exact-digest four-VM matrix and aggregate
+signature all exist and verify. R0 still does not provide N/N-1 upgrade,
+tested application rollback, consistent off-host backup, or clean-host restore. Do not use the
 current SQLite copy endpoint as disaster recovery evidence. A failed data
 volume, failed upgrade or lost host currently requires manual recovery and is
 a production `NO-GO`.

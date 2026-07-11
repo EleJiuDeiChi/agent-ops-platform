@@ -20,6 +20,7 @@ required_files=(
   docs/architecture/adr-0001-load-harness.md
   docs/runbooks/README.md
   docs/security/llm-provider-policy.example.json
+  docs/security/llm-quota-pricing.example.json
   docs/security/threat-model.md
   docs/support-matrix.md
   docs/provenance.md
@@ -29,6 +30,7 @@ required_files=(
   scripts/run-load-smoke.py
   scripts/verify-release-attestations.py
   scripts/validate-ga-manifest.py
+  scripts/assemble-r0-baseline-manifest.py
   scripts/deploy-production.sh
   scripts/assert-production-topology.py
   scripts/test-production-compose.sh
@@ -49,11 +51,13 @@ done
 "$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/assert-production-topology.py"
 "$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/verify-release-attestations.py"
 "$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/validate-ga-manifest.py"
+"$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/assemble-r0-baseline-manifest.py"
 "$PYTHON_BIN" -m py_compile "$ROOT_DIR/scripts/generate-r0-matrix-summary.py"
 "$PYTHON_BIN" "$ROOT_DIR/scripts/probe-llm-contract.py" --help >/dev/null
 "$PYTHON_BIN" "$ROOT_DIR/scripts/run-load-smoke.py" --self-test
 "$PYTHON_BIN" "$ROOT_DIR/scripts/verify-release-attestations.py" --self-test
 "$PYTHON_BIN" "$ROOT_DIR/scripts/validate-ga-manifest.py" --self-test
+"$PYTHON_BIN" "$ROOT_DIR/scripts/assemble-r0-baseline-manifest.py" --self-test
 PYTHONOPTIMIZE=1 "$PYTHON_BIN" "$ROOT_DIR/scripts/generate-r0-matrix-summary.py" --self-test
 "$ROOT_DIR/scripts/deploy-production.sh" --help >/dev/null
 "$ROOT_DIR/scripts/assert-production-topology.py" --help >/dev/null
@@ -68,6 +72,13 @@ for marker in "ubuntu-cloudimage-keyring" "source_archive_sha256" \
     exit 1
   }
 done
+for marker in "prepare_signed_release" "artifact_class\": \"signed_release" \
+  "docker buildx imagetools create" "cosign verify --certificate-identity"; do
+  grep -q "$marker" "$ROOT_DIR/scripts/test-r0-clean-vm-matrix.sh" || {
+    echo "signed-release clean-VM marker is missing: $marker" >&2
+    exit 1
+  }
+done
 grep -q 'SQLite named volume verified on' "$ROOT_DIR/scripts/test-production-compose.sh"
 
 for marker in "syft-version: v1.46.0" "version: v0.72.0" "cosign-release: v3.1.1" \
@@ -75,6 +86,14 @@ for marker in "syft-version: v1.46.0" "version: v0.72.0" "cosign-release: v3.1.1
   "verify-release-attestations.py"; do
   grep -q "$marker" "$ROOT_DIR/.github/workflows/r0-ci.yml" || {
     echo "R0 CI supply-chain marker is missing: $marker" >&2
+    exit 1
+  }
+done
+for marker in "Verify trusted SSH-signed release tag" \
+  "AIOPS_RELEASE_ALLOWED_SIGNERS" "git verify-tag --raw" \
+  '"tag_signature"'; do
+  grep -q "$marker" "$ROOT_DIR/.github/workflows/r0-ci.yml" || {
+    echo "signed release-tag marker is missing: $marker" >&2
     exit 1
   }
 done

@@ -188,12 +188,12 @@ jobs:
     environment:
       name: production-release
     permissions:
-      contents: read
+      contents: write
       packages: write
       id-token: write
 
     steps:
-      - name: Validate immutable semantic release tag
+      - name: Validate semantic release tag
         run: |
           set -euo pipefail
           if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -203,6 +203,58 @@ jobs:
 
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Verify trusted SSH-signed release tag
+        id: tag_signature
+        env:
+          RELEASE_ALLOWED_SIGNERS: ${{ vars.AIOPS_RELEASE_ALLOWED_SIGNERS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$RELEASE_ALLOWED_SIGNERS" || {
+            echo "AIOPS_RELEASE_ALLOWED_SIGNERS repository variable is required" >&2
+            exit 1
+          }
+          test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = tag || {
+            echo "release ref must be an annotated tag object" >&2
+            exit 1
+          }
+          git cat-file -p "refs/tags/$GITHUB_REF_NAME" | grep -F 'BEGIN SSH SIGNATURE' >/dev/null || {
+            echo "release tag must carry an SSH signature" >&2
+            exit 1
+          }
+          mkdir -p evidence/release
+          printf '%s\n' "$RELEASE_ALLOWED_SIGNERS" > evidence/release/release-signers.allowed
+          git config gpg.format ssh
+          git config gpg.ssh.allowedSignersFile "$PWD/evidence/release/release-signers.allowed"
+          git verify-tag --raw "$GITHUB_REF_NAME" > evidence/release/tag-signature-verify.log 2>&1
+          grep -F 'Good "git" signature' evidence/release/tag-signature-verify.log >/dev/null
+          allowed_commit=0
+          while IFS= read -r branch_ref; do
+            if git merge-base --is-ancestor "$GITHUB_SHA" "$branch_ref"; then
+              allowed_commit=1
+              break
+            fi
+          done < <(git for-each-ref --format='%(refname)' \
+            refs/remotes/origin/main refs/remotes/origin/release/)
+          test "$allowed_commit" = 1 || {
+            echo "release tag commit must be reachable from main or release/*" >&2
+            exit 1
+          }
+          echo "allowed_signers_sha256=sha256:$(sha256sum evidence/release/release-signers.allowed | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "verification_log_sha256=sha256:$(sha256sum evidence/release/tag-signature-verify.log | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Reject a reused release version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "a GitHub Release already exists for $GITHUB_REF_NAME; release tags are single-use" >&2
+            exit 1
+          fi
 
       - name: Resolve lowercase GHCR image names
         id: images
@@ -388,11 +440,15 @@ jobs:
           BACKEND_DIGEST: ${{ steps.backend.outputs.digest }}
           FRONTEND_IMAGE: ${{ steps.images.outputs.frontend }}
           FRONTEND_DIGEST: ${{ steps.frontend.outputs.digest }}
+          TAG_ALLOWED_SIGNERS_SHA256: ${{ steps.tag_signature.outputs.allowed_signers_sha256 }}
+          TAG_VERIFICATION_LOG_SHA256: ${{ steps.tag_signature.outputs.verification_log_sha256 }}
         run: |
           set -euo pipefail
           mkdir -p evidence/release
           identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/r0-ci.yml@${GITHUB_REF}"
           issuer="https://token.actions.githubusercontent.com"
+          export RELEASE_CERTIFICATE_IDENTITY="$identity"
+          export RELEASE_OIDC_ISSUER="$issuer"
           cosign version > evidence/release/cosign-version.txt
           cosign verify --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
             --output json "$BACKEND_IMAGE@$BACKEND_DIGEST" > evidence/release/backend-cosign-verify.json
@@ -432,11 +488,11 @@ jobs:
 
           payload = {
               "test_id": "GA-R0-002",
-              "requirement": "immutable build context, SBOM, signature, provenance, and zero HIGH/CRITICAL findings",
+              "requirement": "versioned build context, SBOM, signature, provenance, and zero HIGH/CRITICAL findings",
               "automation": ".github/workflows/r0-ci.yml protected release job",
               "environment": "GitHub Actions production-release environment",
               "fixture_or_seed": os.environ["GITHUB_SHA"],
-              "sample_size_or_duration": "one two-image immutable semantic-version release",
+              "sample_size_or_duration": "one two-image semantic-version release",
               "expected": "both exact image digests are scanned, signed, attested, and semantically verified",
               "evidence_path": ".omx/evidence/production-ga/GA-R0-002/",
               "owner": "release lead",
@@ -448,7 +504,16 @@ jobs:
               "result": "passed",
               "release_tag": os.environ["GITHUB_REF_NAME"],
               "commit_sha": os.environ["GITHUB_SHA"],
+              "repository": os.environ["GITHUB_REPOSITORY"],
               "workflow_ref": os.environ["GITHUB_WORKFLOW_REF"],
+              "certificate_identity": os.environ["RELEASE_CERTIFICATE_IDENTITY"],
+              "oidc_issuer": os.environ["RELEASE_OIDC_ISSUER"],
+              "tag_signature": {
+                  "verified": True,
+                  "format": "ssh",
+                  "allowed_signers_sha256": os.environ["TAG_ALLOWED_SIGNERS_SHA256"],
+                  "verification_log_sha256": os.environ["TAG_VERIFICATION_LOG_SHA256"],
+              },
               "backend": {"image": os.environ["BACKEND_IMAGE"], "digest": os.environ["BACKEND_DIGEST"]},
               "frontend": {"image": os.environ["FRONTEND_IMAGE"], "digest": os.environ["FRONTEND_DIGEST"]},
           }
@@ -457,6 +522,7 @@ jobs:
           )
           PY
           ./scripts/validate-ga-manifest.py \
+            --expected-repository "$GITHUB_REPOSITORY" \
             .omx/evidence/production-ga/GA-R0-002/manifest.json
 
       - name: Upload protected release evidence
@@ -467,3 +533,17 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 90
+
+      - name: Publish versioned release evidence bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tar -C .omx/evidence/production-ga/GA-R0-002 \
+            -czf "GA-R0-002-${GITHUB_REF_NAME}.tar.gz" .
+          gh release create "$GITHUB_REF_NAME" \
+            "GA-R0-002-${GITHUB_REF_NAME}.tar.gz" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Signed production release evidence for commit $GITHUB_SHA."

@@ -34,6 +34,20 @@ HOST_FRONTEND_IMAGE=""
 HOST_TEST_IMAGE=""
 HOST_BACKEND_DIGEST=""
 HOST_FRONTEND_DIGEST=""
+UPSTREAM_BACKEND_IMAGE_REF=""
+UPSTREAM_FRONTEND_IMAGE_REF=""
+RELEASE_MANIFEST=""
+RELEASE_MANIFEST_SHA256=""
+RELEASE_MANIFEST_EVIDENCE_PATH=""
+RELEASE_TAG=""
+RELEASE_CERTIFICATE_IDENTITY=""
+RELEASE_OIDC_ISSUER=""
+BACKEND_COSIGN_SHA256=""
+FRONTEND_COSIGN_SHA256=""
+BACKEND_PROVENANCE_SHA256=""
+FRONTEND_PROVENANCE_SHA256=""
+BACKEND_SBOM_SHA256=""
+FRONTEND_SBOM_SHA256=""
 LIBVIRT_GATEWAY=""
 HOST_REGISTRY=""
 VM_REGISTRY=""
@@ -80,9 +94,11 @@ require_host() {
   [ "$(uname -s)" = "Linux" ] || fail "this harness requires a Linux KVM host"
   [ -e /dev/kvm ] || fail "/dev/kvm is unavailable"
   sudo -n true 2>/dev/null || fail "passwordless sudo is required on the lab host"
-  for command_name in curl docker flock gpg gpgv mkfifo python3 qemu-img rsync scp sha256sum ssh ssh-keygen ss tar tee virt-install; do
+  for command_name in cosign curl docker flock gpg gpgv mkfifo python3 qemu-img rsync scp sha256sum ssh ssh-keygen ss tar tee virt-install; do
     command -v "$command_name" >/dev/null || fail "$command_name is required"
   done
+  cosign version 2>&1 | grep -F 'v3.1.1' >/dev/null || fail "Cosign 3.1.1 is required"
+  docker buildx version >/dev/null 2>&1 || fail "Docker Buildx is required"
   if ! command -v cloud-localds >/dev/null || [ ! -f "$CLOUD_KEYRING" ]; then
     sudo apt-get update -qq
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -249,7 +265,7 @@ prepare_source() {
   mkdir -p "$SOURCE_DIR"
   tar -xf "$SOURCE_ARCHIVE" -C "$SOURCE_DIR"
   [ "$(<"$SOURCE_DIR/.aiops-source-commit")" = "$COMMIT_SHA" ] || fail "source archive commit marker does not match"
-  for relative in scripts/test-r0-clean-vm-matrix.sh scripts/generate-r0-matrix-summary.py; do
+  for relative in scripts/test-r0-clean-vm-matrix.sh scripts/generate-r0-matrix-summary.py scripts/validate-ga-manifest.py scripts/verify-release-attestations.py; do
     source_hash="$(sha256sum "$SOURCE_DIR/$relative" | awk '{print $1}')"
     running_hash="$(sha256sum "$ROOT_DIR/$relative" | awk '{print $1}')"
     [ "$source_hash" = "$running_hash" ] || fail "running $relative does not match the source archive"
@@ -263,9 +279,107 @@ prepare_source() {
   REGISTRY_TAG="$COMMIT_SHA-$RUN_ID"
 }
 
-build_diagnostic_images() {
-  retry_host_command docker build --pull --tag "$HOST_BACKEND_IMAGE" --file "$SOURCE_DIR/backend/Dockerfile" "$SOURCE_DIR"
-  retry_host_command docker build --pull --tag "$HOST_FRONTEND_IMAGE" --file "$SOURCE_DIR/frontend/Dockerfile" "$SOURCE_DIR"
+prepare_signed_release() {
+  local -a release_fields
+  local expected_repository="${AIOPS_R0_EXPECTED_REPOSITORY:-}"
+  [[ "$expected_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || \
+    fail "AIOPS_R0_EXPECTED_REPOSITORY must identify the trusted owner/repository"
+  RELEASE_MANIFEST="${AIOPS_R0_RELEASE_MANIFEST:-}"
+  [ -n "$RELEASE_MANIFEST" ] && [ -f "$RELEASE_MANIFEST" ] || \
+    fail "AIOPS_R0_RELEASE_MANIFEST must point to the canonical GA-R0-002 manifest"
+  RELEASE_MANIFEST="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$RELEASE_MANIFEST")"
+  "$SOURCE_DIR/scripts/validate-ga-manifest.py" \
+    --expected-repository "$expected_repository" "$RELEASE_MANIFEST" || \
+    fail "GA-R0-002 release manifest is invalid"
+  mapfile -t release_fields < <(python3 - "$RELEASE_MANIFEST" "$COMMIT_SHA" "$expected_repository" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+path, commit, expected_repository = sys.argv[1:]
+payload = json.loads(Path(path).read_text(encoding="utf-8"))
+if payload.get("commit_sha") != commit:
+    raise SystemExit("release manifest commit does not match the source archive")
+if payload.get("repository") != expected_repository:
+    raise SystemExit("release manifest repository does not match trusted configuration")
+tag_signature = payload.get("tag_signature")
+if not isinstance(tag_signature, dict) or tag_signature.get("verified") is not True:
+    raise SystemExit("release tag signature is not verified")
+if tag_signature.get("format") != "ssh":
+    raise SystemExit("release tag signature must use SSH signing")
+tag = str(payload.get("release_tag") or "")
+if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
+    raise SystemExit("release tag is not semantic")
+for name in ("backend", "frontend"):
+    image = payload.get(name)
+    if not isinstance(image, dict):
+        raise SystemExit(f"{name} image metadata is missing")
+    print(f"{image['image']}@{image['digest']}")
+print(tag)
+PY
+  )
+  [ "${#release_fields[@]}" -eq 3 ] || fail "release manifest fields are incomplete"
+  UPSTREAM_BACKEND_IMAGE_REF="${release_fields[0]}"
+  UPSTREAM_FRONTEND_IMAGE_REF="${release_fields[1]}"
+  RELEASE_TAG="${release_fields[2]}"
+  RELEASE_CERTIFICATE_IDENTITY="https://github.com/${expected_repository}/.github/workflows/r0-ci.yml@refs/tags/${RELEASE_TAG}"
+  RELEASE_OIDC_ISSUER="https://token.actions.githubusercontent.com"
+  HOST_BACKEND_DIGEST="${UPSTREAM_BACKEND_IMAGE_REF##*@}"
+  HOST_FRONTEND_DIGEST="${UPSTREAM_FRONTEND_IMAGE_REF##*@}"
+  RELEASE_MANIFEST_EVIDENCE_PATH="$EVIDENCE_DIR/release-manifest-$RUN_ID.json"
+  cp "$RELEASE_MANIFEST" "$RELEASE_MANIFEST_EVIDENCE_PATH"
+  chmod 0600 "$RELEASE_MANIFEST_EVIDENCE_PATH"
+  RELEASE_MANIFEST_SHA256="sha256:$(sha256sum "$RELEASE_MANIFEST_EVIDENCE_PATH" | awk '{print $1}')"
+  [[ "$HOST_BACKEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "backend release digest is invalid"
+  [[ "$HOST_FRONTEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "frontend release digest is invalid"
+  local backend_cosign="$EVIDENCE_DIR/backend-cosign-$RUN_ID.json"
+  local frontend_cosign="$EVIDENCE_DIR/frontend-cosign-$RUN_ID.json"
+  local backend_provenance="$EVIDENCE_DIR/backend-provenance-$RUN_ID.json"
+  local frontend_provenance="$EVIDENCE_DIR/frontend-provenance-$RUN_ID.json"
+  local backend_sbom="$EVIDENCE_DIR/backend-sbom-$RUN_ID.json"
+  local frontend_sbom="$EVIDENCE_DIR/frontend-sbom-$RUN_ID.json"
+  cosign verify --certificate-identity "$RELEASE_CERTIFICATE_IDENTITY" \
+    --certificate-oidc-issuer "$RELEASE_OIDC_ISSUER" --output json \
+    "$UPSTREAM_BACKEND_IMAGE_REF" > "$backend_cosign"
+  cosign verify --certificate-identity "$RELEASE_CERTIFICATE_IDENTITY" \
+    --certificate-oidc-issuer "$RELEASE_OIDC_ISSUER" --output json \
+    "$UPSTREAM_FRONTEND_IMAGE_REF" > "$frontend_cosign"
+  cosign verify-attestation --type slsaprovenance1 \
+    --certificate-identity "$RELEASE_CERTIFICATE_IDENTITY" \
+    --certificate-oidc-issuer "$RELEASE_OIDC_ISSUER" \
+    "$UPSTREAM_BACKEND_IMAGE_REF" > "$backend_provenance"
+  cosign verify-attestation --type slsaprovenance1 \
+    --certificate-identity "$RELEASE_CERTIFICATE_IDENTITY" \
+    --certificate-oidc-issuer "$RELEASE_OIDC_ISSUER" \
+    "$UPSTREAM_FRONTEND_IMAGE_REF" > "$frontend_provenance"
+  cosign verify-attestation --type spdxjson \
+    --certificate-identity "$RELEASE_CERTIFICATE_IDENTITY" \
+    --certificate-oidc-issuer "$RELEASE_OIDC_ISSUER" \
+    "$UPSTREAM_BACKEND_IMAGE_REF" > "$backend_sbom"
+  cosign verify-attestation --type spdxjson \
+    --certificate-identity "$RELEASE_CERTIFICATE_IDENTITY" \
+    --certificate-oidc-issuer "$RELEASE_OIDC_ISSUER" \
+    "$UPSTREAM_FRONTEND_IMAGE_REF" > "$frontend_sbom"
+  "$SOURCE_DIR/scripts/verify-release-attestations.py" \
+    --provenance "$backend_provenance" --sbom "$backend_sbom" \
+    --image-ref "$UPSTREAM_BACKEND_IMAGE_REF" --commit-sha "$COMMIT_SHA" \
+    --certificate-identity "$RELEASE_CERTIFICATE_IDENTITY"
+  "$SOURCE_DIR/scripts/verify-release-attestations.py" \
+    --provenance "$frontend_provenance" --sbom "$frontend_sbom" \
+    --image-ref "$UPSTREAM_FRONTEND_IMAGE_REF" --commit-sha "$COMMIT_SHA" \
+    --certificate-identity "$RELEASE_CERTIFICATE_IDENTITY"
+  chmod 0600 "$backend_cosign" "$frontend_cosign" \
+    "$backend_provenance" "$frontend_provenance" "$backend_sbom" "$frontend_sbom"
+  BACKEND_COSIGN_SHA256="sha256:$(sha256sum "$backend_cosign" | awk '{print $1}')"
+  FRONTEND_COSIGN_SHA256="sha256:$(sha256sum "$frontend_cosign" | awk '{print $1}')"
+  BACKEND_PROVENANCE_SHA256="sha256:$(sha256sum "$backend_provenance" | awk '{print $1}')"
+  FRONTEND_PROVENANCE_SHA256="sha256:$(sha256sum "$frontend_provenance" | awk '{print $1}')"
+  BACKEND_SBOM_SHA256="sha256:$(sha256sum "$backend_sbom" | awk '{print $1}')"
+  FRONTEND_SBOM_SHA256="sha256:$(sha256sum "$frontend_sbom" | awk '{print $1}')"
+}
+
+build_test_image() {
   retry_host_command docker build --pull --tag "$HOST_TEST_IMAGE" --file "$SOURCE_DIR/backend/Dockerfile.test" "$SOURCE_DIR"
 }
 
@@ -296,7 +410,7 @@ cleanup_registry() {
 
 cleanup_success_image_artifacts() {
   local image
-  for image in "$HOST_BACKEND_IMAGE" "$HOST_FRONTEND_IMAGE" "$HOST_TEST_IMAGE"; do
+  for image in "$HOST_TEST_IMAGE"; do
     [ -n "$image" ] || continue
     docker image rm "$image" >/dev/null 2>&1 || true
     ! docker image inspect "$image" >/dev/null 2>&1 || \
@@ -312,10 +426,9 @@ cleanup_success_run_artifacts() {
   fi
 }
 
-push_release_images() {
+mirror_release_images() {
   local backend_ref="$HOST_REGISTRY/agent-ops-backend:$REGISTRY_TAG"
   local frontend_ref="$HOST_REGISTRY/agent-ops-frontend:$REGISTRY_TAG"
-  local backend_repo frontend_repo
   retry_host_command docker pull "$REGISTRY_IMAGE" >/dev/null
   REGISTRY_OWNED=1
   docker run --detach --rm \
@@ -330,16 +443,12 @@ push_release_images() {
   done
   curl --fail --silent "http://127.0.0.1:$REGISTRY_PORT/v2/" >/dev/null || \
     fail "ephemeral OCI registry did not become ready"
-  docker tag "$HOST_BACKEND_IMAGE" "$backend_ref"
-  docker tag "$HOST_FRONTEND_IMAGE" "$frontend_ref"
-  docker push "$backend_ref" >/dev/null
-  docker push "$frontend_ref" >/dev/null
-  backend_repo="${backend_ref%:*}"
-  frontend_repo="${frontend_ref%:*}"
-  HOST_BACKEND_DIGEST="$(docker image inspect "$backend_ref" --format '{{range .RepoDigests}}{{println .}}{{end}}' | awk -F@ -v repo="$backend_repo" '$1 == repo {print $2; exit}')"
-  HOST_FRONTEND_DIGEST="$(docker image inspect "$frontend_ref" --format '{{range .RepoDigests}}{{println .}}{{end}}' | awk -F@ -v repo="$frontend_repo" '$1 == repo {print $2; exit}')"
-  [[ "$HOST_BACKEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "backend OCI digest was not resolved"
-  [[ "$HOST_FRONTEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "frontend OCI digest was not resolved"
+  retry_host_command docker buildx imagetools create \
+    --tag "$backend_ref" "$UPSTREAM_BACKEND_IMAGE_REF" >/dev/null
+  retry_host_command docker buildx imagetools create \
+    --tag "$frontend_ref" "$UPSTREAM_FRONTEND_IMAGE_REF" >/dev/null
+  docker buildx imagetools inspect "${backend_ref%:*}@$HOST_BACKEND_DIGEST" >/dev/null
+  docker buildx imagetools inspect "${frontend_ref%:*}@$HOST_FRONTEND_DIGEST" >/dev/null
 }
 
 download_verified_cloud_image() {
@@ -707,7 +816,7 @@ pull_release_image() {
     "docker pull '$image_ref' >/dev/null && docker tag '$image_ref' '$target_image' && docker image inspect '$image_ref' --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep -F '@$digest' >/dev/null"
 }
 
-transfer_diagnostic_images() {
+transfer_release_images() {
   local ip="$1"
   configure_vm_registry "$ip"
   pull_release_image "$ip" agent-ops-backend "$HOST_BACKEND_DIGEST" agent-ops-backend:r0-ci
@@ -732,12 +841,19 @@ run_vm_gate() {
   local manifest="$EVIDENCE_DIR/$evidence_name.json"
   local load_manifest="$EVIDENCE_DIR/$evidence_name-load.json"
   local raw_log_path=".omx/evidence/production-ga/GA-R0-001/$evidence_name-$RUN_ID.log"
+  local backend_cosign_path=".omx/evidence/production-ga/GA-R0-001/backend-cosign-$RUN_ID.json"
+  local frontend_cosign_path=".omx/evidence/production-ga/GA-R0-001/frontend-cosign-$RUN_ID.json"
+  local release_manifest_path=".omx/evidence/production-ga/GA-R0-001/release-manifest-$RUN_ID.json"
+  local backend_provenance_path=".omx/evidence/production-ga/GA-R0-001/backend-provenance-$RUN_ID.json"
+  local frontend_provenance_path=".omx/evidence/production-ga/GA-R0-001/frontend-provenance-$RUN_ID.json"
+  local backend_sbom_path=".omx/evidence/production-ga/GA-R0-001/backend-sbom-$RUN_ID.json"
+  local frontend_sbom_path=".omx/evidence/production-ga/GA-R0-001/frontend-sbom-$RUN_ID.json"
   local -a options pipeline_status
   mapfile -t options < <(ssh_args)
 
   set +e
   ssh "${options[@]}" "aiops@$ip" \
-    "AIOPS_EVIDENCE_NAME='$evidence_name' AIOPS_RAW_LOG_PATH='$raw_log_path' AIOPS_EXPECTED_OS='$expected_os' AIOPS_EXPECTED_DATA_FILESYSTEM='$expected_data_filesystem' AIOPS_EXPECTED_DOCKER_ENGINE='$engine_version' AIOPS_DOCKER_CE_PACKAGE='$docker_package' AIOPS_CONTAINERD_PACKAGE='$containerd_package' AIOPS_BUILDX_PACKAGE='$buildx_package' AIOPS_COMPOSE_PACKAGE='$compose_package' AIOPS_CLOUD_RELEASE='$cloud_release' AIOPS_CLOUD_IMAGE_SHA256='$cloud_image_sha256' AIOPS_CLOUD_KEY_FINGERPRINT='$CLOUD_KEY_FINGERPRINT' AIOPS_DOCKER_GPG_FINGERPRINT='$DOCKER_GPG_FINGERPRINT' AIOPS_REGISTRY_IMAGE='$REGISTRY_IMAGE' AIOPS_SOURCE_ARCHIVE_SHA256='$SOURCE_ARCHIVE_SHA256' AIOPS_EXPECTED_BACKEND_DIGEST='$HOST_BACKEND_DIGEST' AIOPS_EXPECTED_FRONTEND_DIGEST='$HOST_FRONTEND_DIGEST' AIOPS_BACKEND_IMAGE_REF='$VM_REGISTRY/agent-ops-backend@$HOST_BACKEND_DIGEST' AIOPS_FRONTEND_IMAGE_REF='$VM_REGISTRY/agent-ops-frontend@$HOST_FRONTEND_DIGEST' AIOPS_SOURCE_COMMIT='$COMMIT_SHA' bash -s" \
+    "AIOPS_EVIDENCE_NAME='$evidence_name' AIOPS_RAW_LOG_PATH='$raw_log_path' AIOPS_EXPECTED_OS='$expected_os' AIOPS_EXPECTED_DATA_FILESYSTEM='$expected_data_filesystem' AIOPS_EXPECTED_DOCKER_ENGINE='$engine_version' AIOPS_DOCKER_CE_PACKAGE='$docker_package' AIOPS_CONTAINERD_PACKAGE='$containerd_package' AIOPS_BUILDX_PACKAGE='$buildx_package' AIOPS_COMPOSE_PACKAGE='$compose_package' AIOPS_CLOUD_RELEASE='$cloud_release' AIOPS_CLOUD_IMAGE_SHA256='$cloud_image_sha256' AIOPS_CLOUD_KEY_FINGERPRINT='$CLOUD_KEY_FINGERPRINT' AIOPS_DOCKER_GPG_FINGERPRINT='$DOCKER_GPG_FINGERPRINT' AIOPS_REGISTRY_IMAGE='$REGISTRY_IMAGE' AIOPS_SOURCE_ARCHIVE_SHA256='$SOURCE_ARCHIVE_SHA256' AIOPS_EXPECTED_BACKEND_DIGEST='$HOST_BACKEND_DIGEST' AIOPS_EXPECTED_FRONTEND_DIGEST='$HOST_FRONTEND_DIGEST' AIOPS_BACKEND_IMAGE_REF='$VM_REGISTRY/agent-ops-backend@$HOST_BACKEND_DIGEST' AIOPS_FRONTEND_IMAGE_REF='$VM_REGISTRY/agent-ops-frontend@$HOST_FRONTEND_DIGEST' AIOPS_UPSTREAM_BACKEND_IMAGE_REF='$UPSTREAM_BACKEND_IMAGE_REF' AIOPS_UPSTREAM_FRONTEND_IMAGE_REF='$UPSTREAM_FRONTEND_IMAGE_REF' AIOPS_RELEASE_MANIFEST_SHA256='$RELEASE_MANIFEST_SHA256' AIOPS_RELEASE_MANIFEST_PATH='$release_manifest_path' AIOPS_RELEASE_TAG='$RELEASE_TAG' AIOPS_BACKEND_COSIGN_PATH='$backend_cosign_path' AIOPS_FRONTEND_COSIGN_PATH='$frontend_cosign_path' AIOPS_BACKEND_COSIGN_SHA256='$BACKEND_COSIGN_SHA256' AIOPS_FRONTEND_COSIGN_SHA256='$FRONTEND_COSIGN_SHA256' AIOPS_BACKEND_PROVENANCE_PATH='$backend_provenance_path' AIOPS_FRONTEND_PROVENANCE_PATH='$frontend_provenance_path' AIOPS_BACKEND_SBOM_PATH='$backend_sbom_path' AIOPS_FRONTEND_SBOM_PATH='$frontend_sbom_path' AIOPS_BACKEND_PROVENANCE_SHA256='$BACKEND_PROVENANCE_SHA256' AIOPS_FRONTEND_PROVENANCE_SHA256='$FRONTEND_PROVENANCE_SHA256' AIOPS_BACKEND_SBOM_SHA256='$BACKEND_SBOM_SHA256' AIOPS_FRONTEND_SBOM_SHA256='$FRONTEND_SBOM_SHA256' AIOPS_SOURCE_COMMIT='$COMMIT_SHA' bash -s" \
     <<'REMOTE' 2>&1 | tee "$log"
 set -euo pipefail
 umask 077
@@ -847,6 +963,25 @@ payload = {
     "backend_config_id": os.environ["AIOPS_BACKEND_CONFIG_ID"],
     "frontend_config_id": os.environ["AIOPS_FRONTEND_CONFIG_ID"],
     "frontend_release_digest": os.environ["AIOPS_EXPECTED_FRONTEND_DIGEST"],
+    "artifact_class": "signed_release",
+    "upstream_backend_image_ref": os.environ["AIOPS_UPSTREAM_BACKEND_IMAGE_REF"],
+    "upstream_frontend_image_ref": os.environ["AIOPS_UPSTREAM_FRONTEND_IMAGE_REF"],
+    "release_manifest_sha256": os.environ["AIOPS_RELEASE_MANIFEST_SHA256"],
+    "release_manifest_path": os.environ["AIOPS_RELEASE_MANIFEST_PATH"],
+    "release_tag": os.environ["AIOPS_RELEASE_TAG"],
+    "release_tag_signature_verified": True,
+    "backend_cosign_verification_sha256": os.environ["AIOPS_BACKEND_COSIGN_SHA256"],
+    "frontend_cosign_verification_sha256": os.environ["AIOPS_FRONTEND_COSIGN_SHA256"],
+    "backend_cosign_verification_path": os.environ["AIOPS_BACKEND_COSIGN_PATH"],
+    "frontend_cosign_verification_path": os.environ["AIOPS_FRONTEND_COSIGN_PATH"],
+    "backend_provenance_verification_sha256": os.environ["AIOPS_BACKEND_PROVENANCE_SHA256"],
+    "frontend_provenance_verification_sha256": os.environ["AIOPS_FRONTEND_PROVENANCE_SHA256"],
+    "backend_sbom_verification_sha256": os.environ["AIOPS_BACKEND_SBOM_SHA256"],
+    "frontend_sbom_verification_sha256": os.environ["AIOPS_FRONTEND_SBOM_SHA256"],
+    "backend_provenance_verification_path": os.environ["AIOPS_BACKEND_PROVENANCE_PATH"],
+    "frontend_provenance_verification_path": os.environ["AIOPS_FRONTEND_PROVENANCE_PATH"],
+    "backend_sbom_verification_path": os.environ["AIOPS_BACKEND_SBOM_PATH"],
+    "frontend_sbom_verification_path": os.environ["AIOPS_FRONTEND_SBOM_PATH"],
 }
 path = Path(payload["evidence_path"])
 path.parent.mkdir(parents=True, exist_ok=True)
@@ -1099,11 +1234,12 @@ main() {
   trap 'exit 143' TERM
   prepare_state
   prepare_source
+  prepare_signed_release
   "$SOURCE_DIR/scripts/generate-r0-matrix-summary.py" \
     --invalidate --root "$ROOT_DIR" --evidence-dir "$EVIDENCE_DIR" --run-id "$RUN_ID"
   MATRIX_OWNS_STATUS=1
-  build_diagnostic_images
-  push_release_images
+  build_test_image
+  mirror_release_images
   for row in "${MATRIX[@]}"; do
     IFS='|' read -r suffix release os_variant expected_os engine_version docker_package \
       containerd_package buildx_package compose_package compose_version data_filesystem <<< "$row"
@@ -1129,8 +1265,8 @@ main() {
     install_docker_exact "$ip" "$engine_version" "$docker_package" "$containerd_package" \
       "$buildx_package" "$compose_package" "$compose_version"
     sync_checkout "$ip"
-    echo "[$name] transferring immutable diagnostic OCI manifests"
-    transfer_diagnostic_images "$ip"
+    echo "[$name] transferring exact signed release OCI manifests"
+    transfer_release_images "$ip"
     echo "[$name] running R0 blocking gates"
     run_vm_gate "$name" "$evidence_name" "$ip" "$expected_os" "$engine_version" \
       "$docker_package" "$containerd_package" "$buildx_package" "$compose_package" \

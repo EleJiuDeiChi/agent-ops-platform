@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -41,6 +42,7 @@ UNSAFE_SESSION_SECRETS = {
 MAX_SETUP_TTL = timedelta(hours=1)
 RELEASE_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{7,64}$")
+MAX_SECRET_FILE_BYTES = 16 * 1024
 
 
 def _parse_bool(raw: str | None, *, default: bool, name: str) -> tuple[bool, bool]:
@@ -66,20 +68,64 @@ def _parse_datetime(raw: str | None, *, name: str) -> datetime | None:
     return value.astimezone(UTC)
 
 
-def _read_secret_file(path_value: str, *, variable: str) -> str:
+def _read_secret_file(
+    path_value: str,
+    *,
+    variable: str,
+    protected: bool = False,
+) -> str:
     path = Path(path_value)
     try:
-        if not path.is_file():
-            raise ConfigurationError(f"{variable}_FILE must reference a readable regular file")
-        value = path.read_text(encoding="utf-8").rstrip("\r\n")
+        if protected:
+            no_follow = getattr(os, "O_NOFOLLOW", 0)
+            if no_follow == 0:
+                raise ConfigurationError(
+                    f"{variable}_FILE cannot be protected on this platform"
+                )
+            descriptor = os.open(path, os.O_RDONLY | no_follow)
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ConfigurationError(
+                        f"{variable}_FILE must reference a protected regular file"
+                    )
+                if metadata.st_uid not in {0, os.geteuid()}:
+                    raise ConfigurationError(
+                        f"{variable}_FILE must be owned by root or the service account"
+                    )
+                if stat.S_IMODE(metadata.st_mode) & 0o077:
+                    raise ConfigurationError(
+                        f"{variable}_FILE must not be accessible by group or other users"
+                    )
+                if metadata.st_size <= 0 or metadata.st_size > MAX_SECRET_FILE_BYTES:
+                    raise ConfigurationError(
+                        f"{variable}_FILE must be between 1 byte and 16 KiB"
+                    )
+                raw = os.read(descriptor, MAX_SECRET_FILE_BYTES + 1)
+            finally:
+                os.close(descriptor)
+            value = raw.decode("utf-8").rstrip("\r\n")
+        else:
+            if not path.is_file():
+                raise ConfigurationError(
+                    f"{variable}_FILE must reference a readable regular file"
+                )
+            value = path.read_text(encoding="utf-8").rstrip("\r\n")
     except OSError as exc:
         raise ConfigurationError(f"{variable}_FILE could not be read") from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigurationError(f"{variable}_FILE must contain UTF-8 text") from exc
     if not value:
         raise ConfigurationError(f"{variable}_FILE must not be empty")
     return value
 
 
-def _secret_value(environ: Mapping[str, str], variable: str) -> tuple[str | None, bool]:
+def _secret_value(
+    environ: Mapping[str, str],
+    variable: str,
+    *,
+    protected_file: bool = False,
+) -> tuple[str | None, bool]:
     direct = environ.get(variable)
     file_path = environ.get(f"{variable}_FILE")
     if direct is not None and file_path is not None:
@@ -87,7 +133,11 @@ def _secret_value(environ: Mapping[str, str], variable: str) -> tuple[str | None
             f"configure only one of {variable} or {variable}_FILE"
         )
     if file_path is not None:
-        return _read_secret_file(file_path, variable=variable), True
+        return _read_secret_file(
+            file_path,
+            variable=variable,
+            protected=protected_file,
+        ), True
     return direct, direct is not None
 
 
@@ -137,6 +187,7 @@ class Settings:
     llm_enabled_providers_configured: bool
     llm_api_key: str | None = field(repr=False)
     llm_api_key_configured: bool = False
+    llm_api_key_from_file: bool = False
     llm_evidence_file: Path | None = None
     llm_evidence_sha256: str | None = None
 
@@ -215,9 +266,15 @@ class Settings:
             raise ConfigurationError(
                 "production AIOPS_LLM_ENABLED_PROVIDERS must contain exactly the selected AIOPS_LLM_MODE"
             )
+        if self.llm_api_key_configured and not self.llm_api_key_from_file:
+            raise ConfigurationError(
+                "production LLM API keys must use a supported *_API_KEY_FILE; "
+                "direct environment values are forbidden"
+            )
         if not self.llm_api_key_configured or not self.llm_api_key:
             raise ConfigurationError(
-                "production requires AIOPS_LLM_API_KEY or AIOPS_LLM_API_KEY_FILE"
+                "production requires a supported LLM_API_KEY_FILE source "
+                "(*_API_KEY_FILE)"
             )
         if (self.llm_evidence_file is None) != (self.llm_evidence_sha256 is None):
             raise ConfigurationError(
@@ -288,15 +345,31 @@ def load_settings(
         if profile.api_key_variable
     ]
     for variable, provider_id in [("AIOPS_LLM_API_KEY", None), *provider_key_sources]:
-        value, configured = _secret_value(env, variable)
+        if environment is Environment.PROD and env.get(variable) is not None:
+            if provider_id is not None and llm_mode != provider_id:
+                raise ConfigurationError(
+                    f"{variable} can only be used with AIOPS_LLM_MODE={provider_id}"
+                )
+            raise ConfigurationError(
+                "production LLM API keys must use a supported *_API_KEY_FILE; "
+                "direct environment values are forbidden"
+            )
+        value, configured = _secret_value(
+            env,
+            variable,
+            protected_file=environment is Environment.PROD,
+        )
         if configured:
-            key_sources.append((variable, provider_id, value))
+            key_sources.append(
+                (variable, provider_id, value, env.get(f"{variable}_FILE") is not None)
+            )
     if len(key_sources) > 1:
         raise ConfigurationError("configure exactly one supported LLM API key source")
     llm_api_key = None
     llm_api_key_configured = False
+    llm_api_key_from_file = False
     if key_sources:
-        variable, provider_id, llm_api_key = key_sources[0]
+        variable, provider_id, llm_api_key, llm_api_key_from_file = key_sources[0]
         if provider_id is not None and llm_mode != provider_id:
             raise ConfigurationError(
                 f"{variable} can only be used with AIOPS_LLM_MODE={provider_id}"
@@ -374,6 +447,7 @@ def load_settings(
         llm_enabled_providers_configured=enabled_providers_configured,
         llm_api_key=llm_api_key,
         llm_api_key_configured=llm_api_key_configured,
+        llm_api_key_from_file=llm_api_key_from_file,
         llm_evidence_file=(
             Path(env["AIOPS_LLM_EVIDENCE_FILE"])
             if env.get("AIOPS_LLM_EVIDENCE_FILE")

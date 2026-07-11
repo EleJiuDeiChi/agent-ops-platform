@@ -50,9 +50,9 @@ export AIOPS_LLM_THINKING="enabled"
 ```
 
 本仓库正式生产 Compose 只通过 secret file 注入 Key；直接设置
-`AIOPS_LLM_API_KEY` 及厂商兼容别名仅用于本地开发或由外部
-secret manager 提供的受控运行环境，并且不得写入 `.env`、Compose、日志
-或 shell history。
+`AIOPS_LLM_API_KEY` 及厂商兼容别名仅用于非生产本地开发。生产环境即使
+由外部 secret manager 管理，也必须以仅 root/服务账号可读的
+`*_API_KEY_FILE` 提供，不得写入 `.env`、Compose、日志或 shell history。
 
 接入后，诊断链路会由真实模型选择白名单只读工具、读取真实工具结果并生成报告。R0 的重启、写入、恢复和防火墙等 mutation 全部 disabled；只有后续 Node Agent、审批、执行验证与破坏性实验门禁通过后才能逐项启用。
 - 部署：本地优先，Docker Compose 默认绑定 `127.0.0.1`

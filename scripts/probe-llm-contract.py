@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -28,6 +29,7 @@ from app.ai.provider_profiles import (  # noqa: E402
 
 
 RELEASE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 POLICY_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 SECRET_PATTERNS = (
     re.compile(r"(?i)(?:api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+"),
@@ -59,18 +61,29 @@ def _secret_from_environment(provider_id: str) -> str:
         for name, owner in provider_by_name.items()
         if os.getenv(f"{name}_FILE")
     ]
-    if len(direct_values) + len(file_values) != 1:
-        raise ProbeError("configure exactly one supported LLM API key source")
     if direct_values:
-        variable, owner, value = direct_values[0]
-        if owner is not None and owner != provider_id:
-            raise ProbeError(f"{variable} does not match AIOPS_LLM_MODE")
-        return str(value)
+        raise ProbeError(
+            "live probes require a supported *_API_KEY_FILE; "
+            "direct API key environment values are forbidden"
+        )
+    if len(file_values) != 1:
+        raise ProbeError("configure exactly one supported LLM *_API_KEY_FILE source")
     variable, owner, raw_path = file_values[0]
     if owner is not None and owner != provider_id:
         raise ProbeError(f"{variable} does not match AIOPS_LLM_MODE")
     path = Path(str(raw_path))
     try:
+        if path.is_symlink():
+            raise ProbeError(f"{variable} must not be a symlink")
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ProbeError(f"{variable} must reference a regular file")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise ProbeError(f"{variable} must not be accessible by group or other")
+        if metadata.st_uid not in {0, os.geteuid()}:
+            raise ProbeError(f"{variable} must be owned by root or the probe operator")
+        if metadata.st_size <= 0 or metadata.st_size > 16 * 1024:
+            raise ProbeError(f"{variable} has an invalid size")
         value = path.read_text(encoding="utf-8").rstrip("\r\n")
     except OSError as exc:
         raise ProbeError(f"{variable} is not a readable file") from exc
@@ -144,15 +157,20 @@ def _load_policy(
     quota_pricing_snapshot_path: Path,
     *,
     provider_id: str,
-) -> tuple[dict[str, Any], str]:
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
     try:
         policy = json.loads(path.read_text(encoding="utf-8"))
         snapshot = snapshot_path.read_bytes()
-        quota_pricing_snapshot = quota_pricing_snapshot_path.read_bytes()
-    except (OSError, json.JSONDecodeError) as exc:
+        quota_pricing_snapshot_raw = quota_pricing_snapshot_path.read_bytes()
+        quota_pricing_snapshot = json.loads(
+            quota_pricing_snapshot_raw.decode("utf-8")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ProbeError("policy and evidence snapshot files must be readable") from exc
     if not isinstance(policy, dict):
         raise ProbeError("policy file must contain a JSON object")
+    if not isinstance(quota_pricing_snapshot, dict):
+        raise ProbeError("quota and pricing snapshot must contain a JSON object")
     required_strings = (
         "provider_id",
         "account_identifier",
@@ -194,15 +212,6 @@ def _load_policy(
     ):
         raise ProbeError("quota and pricing review must be current within 30 days")
 
-    approvals = policy.get("owner_approvals")
-    if not isinstance(approvals, dict):
-        raise ProbeError("owner_approvals must be an object")
-    for role in ("ai", "security", "privacy"):
-        approval = approvals.get(role)
-        if not isinstance(approval, dict) or approval.get("approved") is not True:
-            raise ProbeError(f"{role} owner approval is required")
-        _parse_timestamp(approval.get("approved_at"), field=f"owner_approvals.{role}.approved_at")
-
     expected_digest = str(policy["provider_policy_sha256"]).lower()
     if not POLICY_DIGEST_RE.fullmatch(expected_digest):
         raise ProbeError("provider_policy_sha256 must use sha256:<64 lowercase hex> format")
@@ -222,7 +231,7 @@ def _load_policy(
             "quota_pricing_snapshot_sha256 must use sha256:<64 lowercase hex> format"
         )
     actual_quota_pricing_digest = (
-        f"sha256:{hashlib.sha256(quota_pricing_snapshot).hexdigest()}"
+        f"sha256:{hashlib.sha256(quota_pricing_snapshot_raw).hexdigest()}"
     )
     if actual_quota_pricing_digest != expected_quota_pricing_digest:
         raise ProbeError(
@@ -286,7 +295,167 @@ def _load_policy(
         field="quota.balance_alert_threshold",
         allow_zero=True,
     )
-    return policy, actual_digest
+
+    snapshot_fields = {
+        "schema_version",
+        "provider_id",
+        "account_identifier",
+        "account_tier",
+        "source_url",
+        "source_content_sha256",
+        "reviewed_at",
+        "currency",
+        "prices_per_million_tokens",
+        "quota",
+    }
+    if set(quota_pricing_snapshot) != snapshot_fields:
+        raise ProbeError(
+            "quota and pricing snapshot must contain exactly the documented fields"
+        )
+    if quota_pricing_snapshot.get("schema_version") != 1:
+        raise ProbeError("quota and pricing snapshot schema_version must be 1")
+    string_bindings = {
+        "provider_id": "provider_id",
+        "account_identifier": "account_identifier",
+        "account_tier": "account_tier",
+        "source_url": "quota_pricing_source_url",
+        "currency": "currency",
+    }
+    for snapshot_field, policy_field in string_bindings.items():
+        snapshot_value = quota_pricing_snapshot.get(snapshot_field)
+        if not isinstance(snapshot_value, str) or not snapshot_value.strip():
+            raise ProbeError(
+                f"quota and pricing snapshot {snapshot_field} must be a non-empty string"
+            )
+        if snapshot_value != policy[policy_field]:
+            raise ProbeError(
+                f"quota and pricing snapshot {snapshot_field} does not match policy"
+            )
+    _validated_https_source_url(
+        quota_pricing_snapshot["source_url"],
+        field="quota_pricing_snapshot.source_url",
+    )
+    source_content_digest = str(
+        quota_pricing_snapshot.get("source_content_sha256") or ""
+    ).lower()
+    if not POLICY_DIGEST_RE.fullmatch(source_content_digest):
+        raise ProbeError(
+            "quota and pricing snapshot source_content_sha256 must use "
+            "sha256:<64 lowercase hex> format"
+        )
+    snapshot_reviewed_at = _parse_timestamp(
+        quota_pricing_snapshot.get("reviewed_at"),
+        field="quota_pricing_snapshot.reviewed_at",
+    )
+    if snapshot_reviewed_at != quota_pricing_reviewed_at:
+        raise ProbeError(
+            "quota and pricing snapshot reviewed_at does not match policy"
+        )
+
+    snapshot_prices = quota_pricing_snapshot.get("prices_per_million_tokens")
+    price_bindings = {
+        "cache_hit_input": "cache_hit_input_cost_per_million_tokens",
+        "cache_miss_input": "input_cost_per_million_tokens",
+        "output": "output_cost_per_million_tokens",
+    }
+    if not isinstance(snapshot_prices, dict) or set(snapshot_prices) != set(
+        price_bindings
+    ):
+        raise ProbeError(
+            "quota and pricing snapshot prices_per_million_tokens is incomplete"
+        )
+    for snapshot_field, policy_field in price_bindings.items():
+        snapshot_price = _positive_decimal(
+            snapshot_prices.get(snapshot_field),
+            field=(
+                "quota_pricing_snapshot.prices_per_million_tokens."
+                f"{snapshot_field}"
+            ),
+            allow_zero=True,
+        )
+        policy_price = _positive_decimal(
+            policy.get(policy_field),
+            field=policy_field,
+            allow_zero=True,
+        )
+        if snapshot_price != policy_price:
+            raise ProbeError(
+                "quota and pricing snapshot prices_per_million_tokens."
+                f"{snapshot_field} does not match policy"
+            )
+
+    snapshot_quota = quota_pricing_snapshot.get("quota")
+    quota_fields = {
+        "concurrency_limit",
+        "requests_per_minute",
+        "tokens_per_minute",
+        "tokens_per_day",
+        "balance_alert_threshold",
+    }
+    if not isinstance(snapshot_quota, dict) or set(snapshot_quota) != quota_fields:
+        raise ProbeError("quota and pricing snapshot quota is incomplete")
+    for field in quota_fields - {"balance_alert_threshold"}:
+        if snapshot_quota.get(field) != quota[field]:
+            raise ProbeError(
+                f"quota and pricing snapshot quota.{field} does not match policy"
+            )
+    snapshot_balance_threshold = _positive_decimal(
+        snapshot_quota.get("balance_alert_threshold"),
+        field="quota_pricing_snapshot.quota.balance_alert_threshold",
+        allow_zero=True,
+    )
+    policy_balance_threshold = _positive_decimal(
+        quota.get("balance_alert_threshold"),
+        field="quota.balance_alert_threshold",
+        allow_zero=True,
+    )
+    if snapshot_balance_threshold != policy_balance_threshold:
+        raise ProbeError(
+            "quota and pricing snapshot quota.balance_alert_threshold does not match policy"
+        )
+
+    approvals = policy.get("owner_approvals")
+    if not isinstance(approvals, dict):
+        raise ProbeError("owner_approvals must be an object")
+    approver_identities: set[str] = set()
+    for role in ("ai", "security", "privacy"):
+        approval = approvals.get(role)
+        if not isinstance(approval, dict) or approval.get("approved") is not True:
+            raise ProbeError(f"{role} owner approval is required")
+        if approval.get("role") != role:
+            raise ProbeError(f"{role} owner approval role does not match")
+        identity = str(approval.get("approver_identity") or "").strip()
+        if not identity or identity != policy[f"{role}_owner"]:
+            raise ProbeError(
+                f"{role} owner approval identity does not match {role}_owner"
+            )
+        normalized_identity = identity.casefold()
+        if normalized_identity in approver_identities:
+            raise ProbeError("AI, security and privacy approvals require unique identities")
+        approver_identities.add(normalized_identity)
+        if str(approval.get("provider_policy_sha256") or "").lower() != actual_digest:
+            raise ProbeError(
+                f"{role} owner approval is not bound to provider policy snapshot"
+            )
+        if (
+            str(approval.get("quota_pricing_snapshot_sha256") or "").lower()
+            != actual_quota_pricing_digest
+        ):
+            raise ProbeError(
+                f"{role} owner approval is not bound to quota and pricing snapshot"
+            )
+        approved_at = _parse_timestamp(
+            approval.get("approved_at"),
+            field=f"owner_approvals.{role}.approved_at",
+        )
+        if approved_at > now + timedelta(minutes=5):
+            raise ProbeError(f"{role} owner approval timestamp is in the future")
+        if approved_at < max(reviewed_at, quota_pricing_reviewed_at):
+            raise ProbeError(
+                f"{role} owner approval predates the reviewed evidence snapshots"
+            )
+
+    return policy, actual_digest, quota_pricing_snapshot
 
 
 def _model_ids(payload: Any) -> list[str]:
@@ -607,16 +776,19 @@ def run_probe(
     base_url = _required_environment("AIOPS_LLM_BASE_URL").rstrip("/")
     model = _required_environment("AIOPS_LLM_MODEL")
     release_digest = _required_environment("AIOPS_RELEASE_DIGEST").lower()
+    commit_sha = _required_environment("AIOPS_COMMIT_SHA").lower()
     runner_identity = _required_environment("AIOPS_EVIDENCE_RUNNER_IDENTITY")
     if not RELEASE_DIGEST_RE.fullmatch(release_digest):
         raise ProbeError("AIOPS_RELEASE_DIGEST must use sha256:<64 lowercase hex> format")
+    if not COMMIT_SHA_RE.fullmatch(commit_sha):
+        raise ProbeError("AIOPS_COMMIT_SHA must be a full lowercase Git SHA")
     try:
         profile.validate_base_url(base_url, production=True)
     except ValueError as exc:
         raise ProbeError(str(exc)) from exc
 
     key = _secret_from_environment(provider_id)
-    policy, policy_digest = _load_policy(
+    policy, policy_digest, quota_pricing_snapshot = _load_policy(
         policy_path,
         snapshot_path,
         quota_pricing_snapshot_path,
@@ -674,7 +846,7 @@ def run_probe(
     )
     _verify_live_snapshot(
         policy["quota_pricing_source_url"],
-        policy["quota_pricing_snapshot_sha256"],
+        quota_pricing_snapshot["source_content_sha256"],
         timeout=connect_timeout,
         label="quota and pricing source",
     )
@@ -828,6 +1000,7 @@ def run_probe(
         "expires_at": (now + timedelta(hours=validity_hours)).isoformat(),
         "runner_identity": runner_identity,
         "release_digest": release_digest,
+        "commit_sha": commit_sha,
         "evidence_path": str(output_path),
         "provider_id": provider_id,
         "feature_flag": {
@@ -893,8 +1066,17 @@ def run_probe(
         "quota_pricing_evidence": {
             "account_tier": policy["account_tier"],
             "source_url": policy["quota_pricing_source_url"],
+            "source_content_sha256": quota_pricing_snapshot[
+                "source_content_sha256"
+            ],
             "snapshot_sha256": policy["quota_pricing_snapshot_sha256"],
+            "snapshot_schema_version": quota_pricing_snapshot["schema_version"],
             "reviewed_at": policy["quota_pricing_reviewed_at"],
+            "currency": quota_pricing_snapshot["currency"],
+            "prices_per_million_tokens": quota_pricing_snapshot[
+                "prices_per_million_tokens"
+            ],
+            "quota": quota_pricing_snapshot["quota"],
         },
         "policy": {
             "region": policy["region"],

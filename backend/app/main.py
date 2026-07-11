@@ -124,9 +124,10 @@ def version(request: Request, response: Response) -> dict:
 
 
 @app.get("/preflight")
-def support_preflight(response: Response) -> dict:
+def support_preflight(request: Request, response: Response) -> dict:
     no_store(response)
-    return evaluate_support()
+    settings = settings_for(request)
+    return evaluate_support(database_path=settings.db_path)
 
 
 @app.get("/health/ready")

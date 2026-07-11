@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -14,6 +14,115 @@ SPEC = importlib.util.spec_from_file_location("aiops_llm_contract_probe", SCRIPT
 assert SPEC is not None and SPEC.loader is not None
 probe = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(probe)
+
+
+def structured_quota_snapshot(policy: dict, source_content: bytes) -> dict:
+    return {
+        "schema_version": 1,
+        "provider_id": policy["provider_id"],
+        "account_identifier": policy["account_identifier"],
+        "account_tier": policy["account_tier"],
+        "source_url": policy["quota_pricing_source_url"],
+        "source_content_sha256": (
+            "sha256:" + hashlib.sha256(source_content).hexdigest()
+        ),
+        "reviewed_at": policy["quota_pricing_reviewed_at"],
+        "currency": policy["currency"],
+        "prices_per_million_tokens": {
+            "cache_hit_input": policy[
+                "cache_hit_input_cost_per_million_tokens"
+            ],
+            "cache_miss_input": policy["input_cost_per_million_tokens"],
+            "output": policy["output_cost_per_million_tokens"],
+        },
+        "quota": dict(policy["quota"]),
+    }
+
+
+def bind_policy_evidence(
+    policy: dict,
+    provider_policy_snapshot: bytes,
+    quota_pricing_snapshot: dict,
+) -> bytes:
+    quota_pricing_raw = json.dumps(
+        quota_pricing_snapshot,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    provider_policy_digest = (
+        "sha256:" + hashlib.sha256(provider_policy_snapshot).hexdigest()
+    )
+    quota_pricing_digest = "sha256:" + hashlib.sha256(quota_pricing_raw).hexdigest()
+    policy["provider_policy_sha256"] = provider_policy_digest
+    policy["quota_pricing_snapshot_sha256"] = quota_pricing_digest
+    policy["owner_approvals"] = {
+        role: {
+            "role": role,
+            "approver_identity": policy[f"{role}_owner"],
+            "approved": True,
+            "approved_at": policy["quota_pricing_reviewed_at"],
+            "provider_policy_sha256": provider_policy_digest,
+            "quota_pricing_snapshot_sha256": quota_pricing_digest,
+        }
+        for role in ("ai", "security", "privacy")
+    }
+    return quota_pricing_raw
+
+
+def valid_policy(now: str) -> dict:
+    return {
+        "provider_id": "deepseek",
+        "account_identifier": "test-deepseek-account",
+        "region": "test-region",
+        "retention": "reviewed-test-retention",
+        "training_opt_out_confirmed": True,
+        "redacted_operational_data_only": True,
+        "ai_owner": "ai-owner",
+        "security_owner": "security-owner",
+        "privacy_owner": "privacy-owner",
+        "provider_policy_url": "https://policy.example.test/provider",
+        "reviewed_at": now,
+        "quota_pricing_source_url": "https://policy.example.test/account-pricing",
+        "quota_pricing_reviewed_at": now,
+        "account_tier": "test-approved-tier",
+        "connect_timeout_seconds": 1,
+        "read_timeout_seconds": 2,
+        "max_retries": 1,
+        "max_output_tokens": 64,
+        "max_input_tokens_per_probe": 4096,
+        "cache_hit_input_cost_per_million_tokens": "0.1",
+        "input_cost_per_million_tokens": "1",
+        "output_cost_per_million_tokens": "2",
+        "cost_cap_per_probe": "0.01",
+        "currency": "CNY",
+        "quota": {
+            "concurrency_limit": 10,
+            "requests_per_minute": "account-tier",
+            "tokens_per_minute": "provider-managed",
+            "tokens_per_day": "unlimited",
+            "balance_alert_threshold": "1",
+        },
+    }
+
+
+def write_policy_evidence(
+    tmp_path: Path,
+    policy: dict,
+    quota_pricing_snapshot: dict,
+) -> tuple[Path, Path, Path]:
+    provider_policy_snapshot = b"reviewed-provider-policy-snapshot"
+    quota_pricing_raw = bind_policy_evidence(
+        policy,
+        provider_policy_snapshot,
+        quota_pricing_snapshot,
+    )
+    policy_path = tmp_path / "policy.json"
+    provider_policy_path = tmp_path / "provider-policy.snapshot"
+    quota_pricing_path = tmp_path / "quota-pricing.snapshot.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    provider_policy_path.write_bytes(provider_policy_snapshot)
+    quota_pricing_path.write_bytes(quota_pricing_raw)
+    return policy_path, provider_policy_path, quota_pricing_path
 
 
 class FakeStreamResponse:
@@ -166,7 +275,7 @@ def test_live_probe_contract_covers_each_built_in_provider_branch(
     expected_discovery: str,
 ) -> None:
     snapshot = b"reviewed-provider-policy-snapshot"
-    quota_pricing_snapshot = b"reviewed-account-quota-and-pricing-snapshot"
+    quota_pricing_source = b"reviewed-account-quota-and-pricing-source"
     now = datetime.now(UTC).isoformat()
     policy = {
         "provider_id": provider_id,
@@ -179,18 +288,10 @@ def test_live_probe_contract_covers_each_built_in_provider_branch(
         "security_owner": "security-owner",
         "privacy_owner": "privacy-owner",
         "provider_policy_url": "https://policy.example.test/provider",
-        "provider_policy_sha256": "sha256:" + hashlib.sha256(snapshot).hexdigest(),
         "reviewed_at": now,
         "quota_pricing_source_url": "https://policy.example.test/account-pricing",
-        "quota_pricing_snapshot_sha256": (
-            "sha256:" + hashlib.sha256(quota_pricing_snapshot).hexdigest()
-        ),
         "quota_pricing_reviewed_at": now,
         "account_tier": "test-approved-tier",
-        "owner_approvals": {
-            role: {"approved": True, "approved_at": now}
-            for role in ("ai", "security", "privacy")
-        },
         "connect_timeout_seconds": 1,
         "read_timeout_seconds": 2,
         "max_retries": 1,
@@ -209,12 +310,21 @@ def test_live_probe_contract_covers_each_built_in_provider_branch(
             "balance_alert_threshold": "1",
         },
     }
+    quota_pricing_snapshot = structured_quota_snapshot(
+        policy,
+        quota_pricing_source,
+    )
+    quota_pricing_raw = bind_policy_evidence(
+        policy,
+        snapshot,
+        quota_pricing_snapshot,
+    )
     policy_path = tmp_path / f"{provider_id}-policy.json"
     snapshot_path = tmp_path / f"{provider_id}-policy.snapshot"
     quota_pricing_snapshot_path = tmp_path / f"{provider_id}-quota-pricing.snapshot"
     policy_path.write_text(json.dumps(policy), encoding="utf-8")
     snapshot_path.write_bytes(snapshot)
-    quota_pricing_snapshot_path.write_bytes(quota_pricing_snapshot)
+    quota_pricing_snapshot_path.write_bytes(quota_pricing_raw)
 
     for name in (
         "AIOPS_LLM_API_KEY",
@@ -231,15 +341,19 @@ def test_live_probe_contract_covers_each_built_in_provider_branch(
     monkeypatch.setenv("AIOPS_LLM_ENABLED_PROVIDERS", provider_id)
     monkeypatch.setenv("AIOPS_LLM_BASE_URL", base_url)
     monkeypatch.setenv("AIOPS_LLM_MODEL", model)
-    monkeypatch.setenv("AIOPS_LLM_API_KEY", "test-only-provider-key")
+    key_path = tmp_path / f"{provider_id}-api-key"
+    key_path.write_text("test-only-provider-key\n", encoding="utf-8")
+    key_path.chmod(0o600)
+    monkeypatch.setenv("AIOPS_LLM_API_KEY_FILE", str(key_path))
     monkeypatch.setenv("AIOPS_RELEASE_DIGEST", "sha256:" + "a" * 64)
+    monkeypatch.setenv("AIOPS_COMMIT_SHA", "b" * 40)
     monkeypatch.setenv("AIOPS_EVIDENCE_RUNNER_IDENTITY", "pytest-runner")
 
     client = FakeProviderClient(model=model, provider_id=provider_id)
     monkeypatch.setattr(probe.httpx, "Client", lambda **kwargs: client)
     def fake_snapshot_get(url: str, **kwargs):
         content = (
-            quota_pricing_snapshot
+            quota_pricing_source
             if url == policy["quota_pricing_source_url"]
             else snapshot
         )
@@ -256,6 +370,7 @@ def test_live_probe_contract_covers_each_built_in_provider_branch(
     )
 
     assert manifest["provider_id"] == provider_id
+    assert manifest["commit_sha"] == "b" * 40
     assert manifest["provider_capabilities"] == {
         "streaming": True,
         "tool_calls": True,
@@ -286,8 +401,17 @@ def test_live_probe_contract_covers_each_built_in_provider_branch(
     assert manifest["quota_pricing_evidence"] == {
         "account_tier": "test-approved-tier",
         "source_url": policy["quota_pricing_source_url"],
+        "source_content_sha256": quota_pricing_snapshot[
+            "source_content_sha256"
+        ],
         "snapshot_sha256": policy["quota_pricing_snapshot_sha256"],
+        "snapshot_schema_version": 1,
         "reviewed_at": now,
+        "currency": "CNY",
+        "prices_per_million_tokens": quota_pricing_snapshot[
+            "prices_per_million_tokens"
+        ],
+        "quota": quota_pricing_snapshot["quota"],
     }
     get_requests = [item for item in client.requests if item[0] == "GET"]
     assert bool(get_requests) is (provider_id != "zhipu")
@@ -311,9 +435,127 @@ def test_probe_rejects_non_finite_pricing_values(value: str) -> None:
         probe._positive_decimal(value, field="price", allow_zero=True)
 
 
+def test_live_probe_rejects_direct_api_key_environment_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "AIOPS_LLM_API_KEY",
+        "AIOPS_LLM_API_KEY_FILE",
+        "AIOPS_DEEPSEEK_API_KEY",
+        "AIOPS_DEEPSEEK_API_KEY_FILE",
+        "AIOPS_MOONSHOT_API_KEY",
+        "AIOPS_MOONSHOT_API_KEY_FILE",
+        "AIOPS_ZHIPU_API_KEY",
+        "AIOPS_ZHIPU_API_KEY_FILE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    key_path = tmp_path / "api-key"
+    key_path.write_text("file-secret\n", encoding="utf-8")
+    key_path.chmod(0o600)
+    monkeypatch.setenv("AIOPS_LLM_API_KEY", "direct-secret")
+    monkeypatch.setenv("AIOPS_LLM_API_KEY_FILE", str(key_path))
+
+    with pytest.raises(probe.ProbeError, match="direct API key environment"):
+        probe._secret_from_environment("deepseek")
+
+
+def test_live_probe_rejects_group_readable_key_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "AIOPS_LLM_API_KEY",
+        "AIOPS_LLM_API_KEY_FILE",
+        "AIOPS_DEEPSEEK_API_KEY",
+        "AIOPS_DEEPSEEK_API_KEY_FILE",
+        "AIOPS_MOONSHOT_API_KEY",
+        "AIOPS_MOONSHOT_API_KEY_FILE",
+        "AIOPS_ZHIPU_API_KEY",
+        "AIOPS_ZHIPU_API_KEY_FILE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    key_path = tmp_path / "insecure-api-key"
+    key_path.write_text("file-secret\n", encoding="utf-8")
+    key_path.chmod(0o640)
+    monkeypatch.setenv("AIOPS_LLM_API_KEY_FILE", str(key_path))
+
+    with pytest.raises(probe.ProbeError, match="group or other"):
+        probe._secret_from_environment("deepseek")
+
+
+@pytest.mark.parametrize(
+    ("field_path", "replacement"),
+    [
+        (("provider_id",), "moonshot"),
+        (("account_identifier",), "different-account"),
+        (("account_tier",), "different-tier"),
+        (("source_url",), "https://policy.example.test/different-source"),
+        (("reviewed_at",), "future-review"),
+        (("currency",), "USD"),
+        (("prices_per_million_tokens", "cache_miss_input"), "1.1"),
+        (("quota", "concurrency_limit"), 11),
+    ],
+)
+def test_probe_rejects_structured_quota_snapshot_semantic_mismatch(
+    tmp_path: Path,
+    field_path: tuple[str, ...],
+    replacement: object,
+) -> None:
+    reviewed_at = datetime.now(UTC)
+    policy = valid_policy(reviewed_at.isoformat())
+    snapshot = structured_quota_snapshot(policy, b"quota-pricing-source")
+    if replacement == "future-review":
+        replacement = (reviewed_at + timedelta(seconds=1)).isoformat()
+    target = snapshot
+    for part in field_path[:-1]:
+        target = target[part]
+    target[field_path[-1]] = replacement
+    paths = write_policy_evidence(tmp_path, policy, snapshot)
+
+    with pytest.raises(probe.ProbeError, match="does not match policy"):
+        probe._load_policy(*paths, provider_id="deepseek")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("duplicate_identity", "unique identities"),
+        ("policy_digest", "not bound to provider policy snapshot"),
+        ("quota_digest", "not bound to quota and pricing snapshot"),
+        ("role", "approval role does not match"),
+    ],
+)
+def test_probe_requires_unique_role_bound_owner_approvals(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    now = datetime.now(UTC).isoformat()
+    policy = valid_policy(now)
+    if mutation == "duplicate_identity":
+        policy["privacy_owner"] = policy["security_owner"].upper()
+    snapshot = structured_quota_snapshot(policy, b"quota-pricing-source")
+    paths = write_policy_evidence(tmp_path, policy, snapshot)
+    if mutation == "policy_digest":
+        policy["owner_approvals"]["ai"]["provider_policy_sha256"] = (
+            "sha256:" + "a" * 64
+        )
+    elif mutation == "quota_digest":
+        policy["owner_approvals"]["security"][
+            "quota_pricing_snapshot_sha256"
+        ] = "sha256:" + "b" * 64
+    elif mutation == "role":
+        policy["owner_approvals"]["privacy"]["role"] = "security"
+    paths[0].write_text(json.dumps(policy), encoding="utf-8")
+
+    with pytest.raises(probe.ProbeError, match=message):
+        probe._load_policy(*paths, provider_id="deepseek")
+
+
 def test_probe_rejects_boolean_quota_marker(tmp_path: Path) -> None:
     snapshot = b"provider-policy"
-    quota_pricing_snapshot = b"quota-pricing"
+    quota_pricing_source = b"quota-pricing-source"
     now = datetime.now(UTC).isoformat()
     policy = {
         "provider_id": "deepseek",
@@ -326,18 +568,10 @@ def test_probe_rejects_boolean_quota_marker(tmp_path: Path) -> None:
         "security_owner": "security-owner",
         "privacy_owner": "privacy-owner",
         "provider_policy_url": "https://policy.example.test/provider",
-        "provider_policy_sha256": "sha256:" + hashlib.sha256(snapshot).hexdigest(),
         "reviewed_at": now,
         "quota_pricing_source_url": "https://policy.example.test/pricing",
-        "quota_pricing_snapshot_sha256": (
-            "sha256:" + hashlib.sha256(quota_pricing_snapshot).hexdigest()
-        ),
         "quota_pricing_reviewed_at": now,
         "account_tier": "test-tier",
-        "owner_approvals": {
-            role: {"approved": True, "approved_at": now}
-            for role in ("ai", "security", "privacy")
-        },
         "connect_timeout_seconds": 1,
         "read_timeout_seconds": 2,
         "max_retries": 1,
@@ -356,12 +590,21 @@ def test_probe_rejects_boolean_quota_marker(tmp_path: Path) -> None:
             "balance_alert_threshold": "0",
         },
     }
+    quota_pricing_snapshot = structured_quota_snapshot(
+        policy,
+        quota_pricing_source,
+    )
+    quota_pricing_raw = bind_policy_evidence(
+        policy,
+        snapshot,
+        quota_pricing_snapshot,
+    )
     policy_path = tmp_path / "policy.json"
     policy_snapshot_path = tmp_path / "policy.snapshot"
     quota_pricing_snapshot_path = tmp_path / "quota-pricing.snapshot"
     policy_path.write_text(json.dumps(policy), encoding="utf-8")
     policy_snapshot_path.write_bytes(snapshot)
-    quota_pricing_snapshot_path.write_bytes(quota_pricing_snapshot)
+    quota_pricing_snapshot_path.write_bytes(quota_pricing_raw)
 
     with pytest.raises(probe.ProbeError, match="quota.concurrency_limit"):
         probe._load_policy(
