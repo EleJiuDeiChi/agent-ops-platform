@@ -38,8 +38,11 @@ also targets the GitHub `production-release` environment. Repository owners
 should configure that environment with required reviewers and prevent
 self-review, tag update/deletion rules and immutable releases when the account
 plan supports those rules. This repository is public and currently enforces
-administrator-inclusive `main` protection plus an active, no-bypass tag
-ruleset that rejects update, deletion and non-fast-forward changes for
+administrator-inclusive `main` protection, strict required CI, resolved
+conversations and linear history. Human PR approval is temporarily omitted in
+the single-maintainer development phase because no second authorized
+collaborator exists; it must be restored before RC or GA. An active, no-bypass
+tag ruleset rejects update, deletion and non-fast-forward changes for
 `v*.*.*`. The workflow also rejects an already published release version and
 serializes runs per tag. The repository now trusts the dedicated SSH principal
 `agent-ops-release@EleJiuDeiChi` through `AIOPS_RELEASE_ALLOWED_SIGNERS` with

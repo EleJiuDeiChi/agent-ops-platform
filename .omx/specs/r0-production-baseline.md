@@ -14,9 +14,11 @@ Sources:
 - Repository visibility: public, after a full reachable-history secret scan.
 - Default branch: `main`, protected for administrators and contributors. It
   requires an up-to-date branch, the `Chromium E2E` and
-  `Test, audit, build and supply-chain evidence` checks, one approval from
-  someone other than the last pusher, stale-review dismissal, resolved
-  conversations and linear history; force-push and deletion are disabled.
+  `Test, audit, build and supply-chain evidence` checks, resolved conversations
+  and linear history; force-push and deletion are disabled. During the current
+  single-maintainer development phase, no human PR approval is required because
+  the repository has no second authorized collaborator. One independent
+  approval must be restored before an RC or GA merge.
 - Release stabilization branches: `release/<major>.<minor>`; no direct feature
   development after freeze.
 - Signed immutable tags: `v<major>.<minor>.<patch>` pointing to the reviewed
