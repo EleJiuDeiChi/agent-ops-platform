@@ -11,7 +11,14 @@ Sources:
 
 ## Git and release convention
 
-- Default branch: `main`, protected once the remote exists.
+- Repository visibility: public, after a full reachable-history secret scan.
+- Default branch: `main`, protected for administrators and contributors. It
+  requires an up-to-date branch, the `Chromium E2E` and
+  `Test, audit, build and supply-chain evidence` checks, resolved conversations
+  and linear history; force-push and deletion are disabled. During the current
+  single-maintainer development phase, no human PR approval is required because
+  the repository has no second authorized collaborator. One independent
+  approval must be restored before an RC or GA merge.
 - Release stabilization branches: `release/<major>.<minor>`; no direct feature
   development after freeze.
 - Signed immutable tags: `v<major>.<minor>.<patch>` pointing to the reviewed
@@ -19,9 +26,16 @@ Sources:
 - Every commit follows the repository Lore protocol: intent-first subject,
   rationale body and applicable `Constraint`, `Rejected`, `Confidence`,
   `Scope-risk`, `Directive`, `Tested`, and `Not-tested` trailers.
-- The first reviewed `main` commit is created only after local R0 gates pass.
-  Remote protection, protected release environment and signed tag remain
-  external release-owner actions and keep R0 `NO-GO` until evidenced.
+- The active repository ruleset prevents updates, deletion and non-fast-forward
+  changes to matching `v*.*.*` release tags without a bypass actor. The
+  `production-release` environment accepts only matching tag refs.
+- The repository trusts the dedicated SSH signing principal
+  `agent-ops-release@EleJiuDeiChi` through
+  `AIOPS_RELEASE_ALLOWED_SIGNERS`; its Ed25519 fingerprint is
+  `SHA256:PRx3q+2GoqeWm33uf2BaKhcuVW/dGRaHAsL3EMiaTqM` and the private key is
+  retained outside the repository. Independent environment reviewers, a newly
+  signed tag and its successful release evidence remain external release-owner
+  actions and keep R0 `NO-GO` until evidenced.
 
 ## Delivered deployment invariants
 
