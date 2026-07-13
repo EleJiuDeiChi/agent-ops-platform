@@ -70,6 +70,28 @@ export AIOPS_LLM_THINKING="enabled"
 
 调试阶段默认启用 `AIOPS_DEBUG_SKIP_PASSWORD_CHANGE=1`，登录后直接进入功能页。
 
+### 开发机临时 DeepSeek 凭据
+
+开发机后端由 `agent-ops-dev-backend.service` 托管，默认使用 `mock`。需要
+验证真实 DeepSeek 时，在开发机项目目录运行：
+
+```bash
+./scripts/manage-dev-deepseek.sh install
+./scripts/manage-dev-deepseek.sh status
+```
+
+`install` 会无回显读取 Key，并通过 TPM2 与 `systemd-creds` 加密到开发机
+`/etc/credstore.encrypted/`；服务运行时只接收只读 credential 文件路径，Key
+不会进入 Git、`.env`、进程环境或日志。测试结束后执行：
+
+```bash
+./scripts/manage-dev-deepseek.sh remove
+```
+
+删除加密凭据后，后端会自动恢复 `mock` 模式。该机制只用于开发验证，不能
+替代生产环境的 provider policy、quota/pricing snapshot、三方审批和 live
+evidence 门禁。
+
 ## 验证
 
 ```bash
