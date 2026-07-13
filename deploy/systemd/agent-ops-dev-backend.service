@@ -1,0 +1,37 @@
+[Unit]
+Description=Agent Ops Platform development backend
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Documents/trae_projects/业务效率工具/Agent运维平台
+Environment=PYTHONPATH=/home/ubuntu/Documents/trae_projects/业务效率工具/Agent运维平台/backend
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=AIOPS_DB_PATH=/home/ubuntu/Documents/trae_projects/业务效率工具/Agent运维平台/data/dev-preview.sqlite
+Environment=AIOPS_DEBUG_SKIP_PASSWORD_CHANGE=1
+Environment=AIOPS_LLM_MODE=mock
+ExecStart=/home/ubuntu/Documents/trae_projects/业务效率工具/Agent运维平台/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8080
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/Documents/trae_projects/业务效率工具/Agent运维平台/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+StandardOutput=append:/home/ubuntu/Documents/trae_projects/业务效率工具/Agent运维平台/data/devbox-backend.log
+StandardError=append:/home/ubuntu/Documents/trae_projects/业务效率工具/Agent运维平台/data/devbox-backend.log
+
+[Install]
+WantedBy=multi-user.target
